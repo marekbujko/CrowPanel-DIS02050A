@@ -96,6 +96,7 @@ This project turns the **CrowPanel Advance 5"** into a standalone LoRa mesh comm
 |---------|---------|
 | **Custom UI** | CrowPanel-focused Meshtastic interface with chat list, message view, nodes, and settings screens |
 | **Touch Keyboard** | On-screen keyboard with a MeshCore-style layout tuned for the 5" display |
+| **Custom Channels** | Add or join Meshtastic channels directly from the device — tap the "+" on the Chats tab, enter a name, and leave the key blank to create a new channel or paste a base64 PSK to join an existing one |
 | **Private Chats** | Long-press private chats to delete local chat history with confirmation |
 | **Security Tools** | Regenerate private keys directly from settings |
 | **Radio Defaults** | TX power defaults to 20 dBm, with 22 dBm still available as a manual option |
