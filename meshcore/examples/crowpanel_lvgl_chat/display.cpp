@@ -15,6 +15,10 @@
 #include <extra/widgets/keyboard/lv_keyboard.h>
 #include "LovyanGFX_Driver.h"
 
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/queue.h>
+
 #include "persistence.h"
 
 #include "ui.h"
@@ -76,11 +80,35 @@ static lv_disp_draw_buf_t draw_buf;
 static lv_color_t *buf0, *buf1;
 static uint16_t tx_touch, ty_touch;
 
+// Flush is offloaded to a worker task pinned to core 0 so the rotated
+// SRAM->PSRAM copy runs in parallel with LVGL render on core 1.
+struct flush_msg_t {
+  lv_disp_drv_t* drv;
+  lv_area_t      area;
+  lv_color_t*    px;
+};
+static QueueHandle_t s_flush_q = nullptr;
+
+static void flush_worker_task(void*) {
+  flush_msg_t m;
+  for (;;) {
+    if (xQueueReceive(s_flush_q, &m, portMAX_DELAY) != pdTRUE) continue;
+    if (g_screen_awake) {
+      gfx.pushImage(m.area.x1, m.area.y1,
+                    m.area.x2 - m.area.x1 + 1,
+                    m.area.y2 - m.area.y1 + 1,
+                    (lgfx::rgb565_t*)m.px);
+    }
+    lv_disp_flush_ready(m.drv);
+  }
+}
+
 static void flush_cb(lv_disp_drv_t* drv, const lv_area_t* a, lv_color_t* p) {
-  if (!g_screen_awake) { lv_disp_flush_ready(drv); return; }
-  gfx.waitDMA();
-  gfx.pushImageDMA(a->x1, a->y1, a->x2-a->x1+1, a->y2-a->y1+1, (lgfx::rgb565_t*)p);
-  lv_disp_flush_ready(drv);
+  if (!g_screen_awake || !s_flush_q) { lv_disp_flush_ready(drv); return; }
+  flush_msg_t m = { drv, *a, p };
+  // Block if the worker is still busy with the previous chunk — provides
+  // the same backpressure as the old synchronous path.
+  xQueueSend(s_flush_q, &m, portMAX_DELAY);
 }
 
 static void touch_cb(lv_indev_drv_t*, lv_indev_data_t* d) {
@@ -404,16 +432,30 @@ void init_display_and_ui() {
   gfx.initDMA();
   gfx.fillScreen(TFT_BLACK);
 
+  // Worker task on core 0 owns the rotated SRAM->PSRAM copy so the main
+  // loop on core 1 can keep rendering while the previous chunk is pushed.
+  // Queue depth 1 matches LVGL's two-buffer flow (only one flush in flight).
+  s_flush_q = xQueueCreate(1, sizeof(flush_msg_t));
+  xTaskCreatePinnedToCore(flush_worker_task, "lcdflush", 4096,
+                          nullptr, 2, nullptr, 0);
+
   lv_init();
   lv_font_greek_init();
 
-  int buf_rows = 96000 / SCR_W;   // 200 portrait, 120 landscape
-  int buf_fallback = 19200 / SCR_W; // 40 portrait, 24 landscape
-  buf0 = (lv_color_t*)heap_caps_malloc(SCR_W * buf_rows * sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
-  buf1 = (lv_color_t*)heap_caps_malloc(SCR_W * buf_rows * sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
+  // Draw buffers: prefer internal SRAM (DMA-capable) so LVGL render and the
+  // flush copy don't fight the LCD GDMA for PSRAM bandwidth. The RGB panel
+  // streams its 768 KB framebuffer from PSRAM continuously, so PSRAM-resident
+  // draw buffers stall on every read and write.
+  int buf_rows = 38400 / SCR_W;       // 80 portrait, 48 landscape (~77 KB each in SRAM)
+  int buf_rows_psram = 96000 / SCR_W; // fallback: 200 portrait, 120 landscape
+  buf0 = (lv_color_t*)heap_caps_malloc(SCR_W * buf_rows * sizeof(lv_color_t), MALLOC_CAP_INTERNAL|MALLOC_CAP_DMA);
+  buf1 = (lv_color_t*)heap_caps_malloc(SCR_W * buf_rows * sizeof(lv_color_t), MALLOC_CAP_INTERNAL|MALLOC_CAP_DMA);
   if (!buf0 || !buf1) {
-    buf0 = (lv_color_t*)heap_caps_malloc(SCR_W * buf_fallback * sizeof(lv_color_t), MALLOC_CAP_INTERNAL|MALLOC_CAP_DMA);
-    buf1 = (lv_color_t*)heap_caps_malloc(SCR_W * buf_fallback * sizeof(lv_color_t), MALLOC_CAP_INTERNAL|MALLOC_CAP_DMA);
+    if (buf0) { heap_caps_free(buf0); buf0 = nullptr; }
+    if (buf1) { heap_caps_free(buf1); buf1 = nullptr; }
+    buf_rows = buf_rows_psram;
+    buf0 = (lv_color_t*)heap_caps_malloc(SCR_W * buf_rows * sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
+    buf1 = (lv_color_t*)heap_caps_malloc(SCR_W * buf_rows * sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
   }
   if (!buf0 || !buf1) while (1) delay(1000);
 
@@ -431,7 +473,7 @@ void init_display_and_ui() {
 
   {
     lv_disp_t* disp = lv_disp_get_default();
-    if (disp && disp->refr_timer) lv_timer_set_period(disp->refr_timer, 20);
+    if (disp && disp->refr_timer) lv_timer_set_period(disp->refr_timer, 33);
   }
 
   delay(50);

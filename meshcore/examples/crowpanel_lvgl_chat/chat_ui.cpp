@@ -58,7 +58,7 @@ lv_obj_t* chat_add(bool out, const char* txt, bool live, char loaded_status, con
   int shift_pct  = g_landscape_mode ? 35 : 18;
   lv_obj_set_width(bubble, lv_pct(bubble_pct));
   lv_obj_set_height(bubble, LV_SIZE_CONTENT);
-  lv_obj_set_style_radius(bubble, 16, 0);
+  lv_obj_set_style_radius(bubble, 4, 0);
   lv_obj_set_style_bg_color(bubble, lv_color_hex(out ? g_theme->bubble_out : g_theme->bubble_in), 0);
   lv_obj_set_style_bg_opa(bubble, LV_OPA_COVER, 0);
   lv_obj_set_style_border_opa(bubble, LV_OPA_TRANSP, 0);
