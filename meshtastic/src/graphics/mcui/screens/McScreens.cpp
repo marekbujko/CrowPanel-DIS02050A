@@ -2,12 +2,14 @@
 
 #include "McScreens.h"
 #include "McChatView.h"
+#include "../McKeyboard.h"
 #include "../McTheme.h"
 #include "../McUI.h"
 #include "../data/McMessages.h"
 
 #include "configuration.h"
 #include "mesh/Channels.h"
+#include "mesh/MeshService.h"
 #include "mesh/NodeDB.h"
 #include "mesh/generated/meshtastic/channel.pb.h"
 #include "mesh/wifi/WiFiAPClient.h"
@@ -16,6 +18,9 @@
 #include <WiFi.h>
 #endif
 
+#include <Arduino.h>
+#include <esp_random.h>
+#include <mbedtls/base64.h>
 #include <cstdio>
 #include <cstring>
 
@@ -35,6 +40,96 @@ static lv_obj_t *make_page(lv_obj_t *parent)
     lv_obj_set_style_pad_all(p, 0, 0);
     lv_obj_remove_flag(p, LV_OBJ_FLAG_SCROLLABLE);
     return p;
+}
+
+// Avatar color palette — hashed from (kind, value, title) so each
+// conversation gets a stable colored circle.
+static const uint32_t kAvatarPalette[TH_AVATAR_PALETTE_COUNT] = { TH_AVATAR_PALETTE_LIST };
+
+static uint32_t avatar_color_for(const McConvId &id, const char *title)
+{
+    uint32_t h = 2166136261u ^ (uint32_t)id.kind ^ id.value;
+    if (title) {
+        for (const char *p = title; *p; p++) {
+            h ^= (uint8_t)(unsigned char)*p;
+            h *= 16777619u;
+        }
+    }
+    return kAvatarPalette[h % TH_AVATAR_PALETTE_COUNT];
+}
+
+// ---- Channel create / delete ----------------------------------------------
+// Bridge to Meshtastic core's `channels` singleton + persistence path.
+// `psk_len == 0` (with psk == nullptr) creates a new channel with a fresh
+// random 16-byte key. A non-null psk of length 1/16/32 joins an existing
+// channel by writing that PSK into a free secondary slot.
+static bool channel_create(const char *name, const uint8_t *psk = nullptr, size_t psk_len = 0)
+{
+    if (!name || !*name) return false;
+    if (psk_len != 0 && psk_len != 1 && psk_len != 16 && psk_len != 32) {
+        LOG_WARN("mcui: channel_create: psk_len=%u invalid (must be 0/1/16/32)", (unsigned)psk_len);
+        return false;
+    }
+
+    int target = -1;
+    for (uint8_t i = 1; i < channels.getNumChannels(); i++) {
+        meshtastic_Channel &c = channels.getByIndex(i);
+        if (c.role == meshtastic_Channel_Role_DISABLED) {
+            target = i;
+            break;
+        }
+    }
+    if (target < 0) {
+        LOG_WARN("mcui: channel_create: no free secondary slot");
+        return false;
+    }
+
+    meshtastic_Channel ch = channels.getByIndex(target);
+    ch.index           = target;
+    ch.role            = meshtastic_Channel_Role_SECONDARY;
+    ch.has_settings    = true;
+    memset(&ch.settings, 0, sizeof(ch.settings));
+    strncpy(ch.settings.name, name, sizeof(ch.settings.name) - 1);
+    ch.settings.name[sizeof(ch.settings.name) - 1] = '\0';
+
+    if (psk && psk_len > 0) {
+        memcpy(ch.settings.psk.bytes, psk, psk_len);
+        ch.settings.psk.size = psk_len;
+    } else {
+        ch.settings.psk.size = 16;
+        esp_fill_random(ch.settings.psk.bytes, 16);
+    }
+
+    channels.setChannel(ch);
+    channels.onConfigChanged();
+    if (service)
+        service->reloadConfig(SEGMENT_CHANNELS);
+    else if (nodeDB)
+        nodeDB->saveToDisk(SEGMENT_CHANNELS);
+
+    LOG_INFO("mcui: %s channel '%s' in slot %d (psk_len=%u)",
+             (psk && psk_len) ? "joined" : "created", name, target,
+             (unsigned)ch.settings.psk.size);
+    return true;
+}
+
+static bool channel_delete(uint8_t idx)
+{
+    if (idx == 0 || idx >= channels.getNumChannels()) return false;
+    meshtastic_Channel ch = channels.getByIndex(idx);
+    if (ch.role == meshtastic_Channel_Role_DISABLED) return false;
+
+    LOG_INFO("mcui: deleting channel slot %d (name='%s')", idx, ch.settings.name);
+    ch.role = meshtastic_Channel_Role_DISABLED;
+    ch.has_settings = true;
+    memset(&ch.settings, 0, sizeof(ch.settings));
+    channels.setChannel(ch);
+    channels.onConfigChanged();
+    if (service)
+        service->reloadConfig(SEGMENT_CHANNELS);
+    else if (nodeDB)
+        nodeDB->saveToDisk(SEGMENT_CHANNELS);
+    return true;
 }
 
 // ============================================================================
@@ -92,18 +187,30 @@ static void chat_delete_confirm_cb(lv_event_t *e)
     bool do_delete = (btn == (lv_obj_t *)lv_event_get_user_data(e));
     McConvId id = s_pending_delete_id;
     chat_delete_overlay_close();
+    if (!do_delete) return;
 
-    if (do_delete && id.kind == McConvId::DIRECT) {
-        messages_delete_conv(id);
-        rebuild_chats_list();
+    // Always clear the message history. For secondary channels, also free
+    // the slot. Primary channel (slot 0) only clears history — the channel
+    // itself stays.
+    messages_delete_conv(id);
+
+    if (id.kind == McConvId::CHANNEL && id.value > 0) {
+        channel_delete((uint8_t)id.value);
     }
+
+    rebuild_chats_list();
 }
 
 static void chat_card_long_pressed(lv_event_t *e)
 {
     lv_obj_t *obj = (lv_obj_t *)lv_event_get_current_target(e);
     ChatEntry *ent = (ChatEntry *)lv_obj_get_user_data(obj);
-    if (!ent || ent->id.kind != McConvId::DIRECT) return;
+    if (!ent) return;
+
+    // Channels and DMs are both long-pressable; everything else (dividers,
+    // section headers) is not.
+    if (ent->id.kind != McConvId::DIRECT && ent->id.kind != McConvId::CHANNEL) return;
+
     s_suppress_click_id = ent->id;
     s_suppress_click_ms = lv_tick_get();
 
@@ -113,6 +220,29 @@ static void chat_card_long_pressed(lv_event_t *e)
 
     chat_delete_overlay_close();
     s_pending_delete_id = ent->id;
+
+    const bool is_channel   = (ent->id.kind == McConvId::CHANNEL);
+    const bool is_primary   = (is_channel && ent->id.value == 0);
+    const bool is_secondary = (is_channel && ent->id.value > 0);
+
+    char title[96];
+    const char *body_text;
+    const char *delete_label;
+    if (is_primary) {
+        snprintf(title, sizeof(title), "Clear chat history?\n%s", ent->title);
+        body_text = "Deletes the message history for this primary channel. "
+                    "The channel itself stays — you keep receiving messages on it.";
+        delete_label = "Clear history";
+    } else if (is_secondary) {
+        snprintf(title, sizeof(title), "Delete channel?\n%s", ent->title);
+        body_text = "Permanently removes this channel and all its messages. "
+                    "You will stop sending and receiving on this channel.";
+        delete_label = "Delete channel";
+    } else {
+        snprintf(title, sizeof(title), "Delete private chat?\n%s", ent->title);
+        body_text = "This deletes only the message history. The node stays in your node list.";
+        delete_label = "Delete chat";
+    }
 
     lv_obj_t *scr = lv_screen_active();
     s_chat_delete_overlay = lv_obj_create(scr);
@@ -134,8 +264,6 @@ static void chat_card_long_pressed(lv_event_t *e)
     lv_obj_set_style_pad_all(card, 16, 0);
     lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
 
-    char title[88];
-    snprintf(title, sizeof(title), "Delete private chat?\n%s", ent->title);
     lv_obj_t *tl = lv_label_create(card);
     lv_label_set_text(tl, title);
     lv_label_set_long_mode(tl, LV_LABEL_LONG_DOT);
@@ -145,7 +273,7 @@ static void chat_card_long_pressed(lv_event_t *e)
     lv_obj_align(tl, LV_ALIGN_TOP_LEFT, 0, 0);
 
     lv_obj_t *body = lv_label_create(card);
-    lv_label_set_text(body, "This deletes only the message history. The node stays in your node list.");
+    lv_label_set_text(body, body_text);
     lv_label_set_long_mode(body, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(body, lv_pct(100));
     lv_obj_set_style_text_color(body, lv_color_hex(TH_TEXT2), 0);
@@ -169,13 +297,252 @@ static void chat_card_long_pressed(lv_event_t *e)
     lv_obj_set_style_bg_color(delete_btn, lv_color_hex(0xB83232), 0);
     lv_obj_set_style_radius(delete_btn, 8, 0);
     lv_obj_t *dl = lv_label_create(delete_btn);
-    lv_label_set_text(dl, "Delete chat");
+    lv_label_set_text(dl, delete_label);
     lv_obj_set_style_text_color(dl, lv_color_hex(0xFFFFFF), 0);
     lv_obj_set_style_text_font(dl, &lv_font_montserrat_16, 0);
     lv_obj_center(dl);
 
     lv_obj_add_event_cb(cancel, chat_delete_confirm_cb, LV_EVENT_CLICKED, delete_btn);
     lv_obj_add_event_cb(delete_btn, chat_delete_confirm_cb, LV_EVENT_CLICKED, delete_btn);
+}
+
+// ---- New / join channel modal ---------------------------------------------
+// Single combined modal: empty PSK -> create with random key, non-empty
+// PSK (base64) -> join an existing channel by writing that key into a
+// free secondary slot.
+
+static lv_obj_t *s_chcreate_overlay = nullptr;
+static lv_obj_t *s_chcreate_name    = nullptr;
+static lv_obj_t *s_chcreate_psk     = nullptr;
+static lv_obj_t *s_chcreate_status  = nullptr;
+
+static void chcreate_close()
+{
+    keyboard_hide();
+    if (s_chcreate_overlay) {
+        lv_obj_delete(s_chcreate_overlay);
+        s_chcreate_overlay = nullptr;
+    }
+    s_chcreate_name   = nullptr;
+    s_chcreate_psk    = nullptr;
+    s_chcreate_status = nullptr;
+}
+
+static void chcreate_cancel_cb(lv_event_t *) { chcreate_close(); }
+
+static void chcreate_status(const char *msg, bool ok)
+{
+    if (!s_chcreate_status) return;
+    lv_label_set_text(s_chcreate_status, msg);
+    lv_obj_set_style_text_color(s_chcreate_status,
+                                lv_color_hex(ok ? 0x45D483 : 0xE05050), 0);
+}
+
+// Strip whitespace from a base64 string (paste-from-phone friendly).
+static size_t b64_clean(const char *in, char *out, size_t out_sz)
+{
+    size_t n = 0;
+    if (!in) return 0;
+    for (; *in && n + 1 < out_sz; in++) {
+        char c = *in;
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') continue;
+        out[n++] = c;
+    }
+    out[n] = '\0';
+    return n;
+}
+
+static void chcreate_ok_cb(lv_event_t *)
+{
+    if (!s_chcreate_name) { chcreate_close(); return; }
+
+    // Trim whitespace from name
+    const char *raw_name = lv_textarea_get_text(s_chcreate_name);
+    if (!raw_name) { chcreate_close(); return; }
+    char name[12] = {};
+    int len = (int)strlen(raw_name);
+    int s = 0;
+    while (s < len && (raw_name[s] == ' ' || raw_name[s] == '\t')) s++;
+    int e = len;
+    while (e > s && (raw_name[e-1] == ' ' || raw_name[e-1] == '\t')) e--;
+    int copy = e - s;
+    if (copy > (int)sizeof(name) - 1) copy = sizeof(name) - 1;
+    if (copy > 0) memcpy(name, raw_name + s, copy);
+    name[copy] = '\0';
+    if (!name[0]) {
+        chcreate_status("Enter a channel name", false);
+        return;
+    }
+
+    // PSK: blank means "create with random key"; non-blank must base64-decode
+    // to exactly 1, 16, or 32 bytes.
+    const uint8_t *psk_ptr = nullptr;
+    size_t         psk_len = 0;
+    uint8_t        psk_buf[32];
+
+    if (s_chcreate_psk) {
+        const char *raw_psk = lv_textarea_get_text(s_chcreate_psk);
+        char cleaned[80];
+        size_t clen = b64_clean(raw_psk, cleaned, sizeof(cleaned));
+        if (clen > 0) {
+            size_t olen = 0;
+            int rc = mbedtls_base64_decode(psk_buf, sizeof(psk_buf), &olen,
+                                           (const unsigned char *)cleaned, clen);
+            if (rc != 0) {
+                chcreate_status("PSK is not valid base64", false);
+                return;
+            }
+            if (olen != 1 && olen != 16 && olen != 32) {
+                chcreate_status("Decoded PSK must be 1, 16, or 32 bytes", false);
+                return;
+            }
+            psk_ptr = psk_buf;
+            psk_len = olen;
+        }
+    }
+
+    if (!channel_create(name, psk_ptr, psk_len)) {
+        chcreate_status("No free channel slot (delete one first)", false);
+        return;
+    }
+    rebuild_chats_list();
+    chcreate_close();
+}
+
+static void chcreate_focus_cb(lv_event_t *e)
+{
+    lv_obj_t *ta = (lv_obj_t *)lv_event_get_current_target(e);
+    keyboard_attach(ta);
+    keyboard_show();
+}
+
+static void chcreate_open()
+{
+    chcreate_close();
+
+    lv_obj_t *scr = lv_screen_active();
+    s_chcreate_overlay = lv_obj_create(scr);
+    lv_obj_remove_style_all(s_chcreate_overlay);
+    lv_obj_set_size(s_chcreate_overlay, SCR_W, SCR_H);
+    lv_obj_set_pos(s_chcreate_overlay, 0, 0);
+    lv_obj_set_style_bg_color(s_chcreate_overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_chcreate_overlay, LV_OPA_60, 0);
+    lv_obj_remove_flag(s_chcreate_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_move_foreground(s_chcreate_overlay);
+
+    const int card_h = 340;
+    lv_obj_t *card = lv_obj_create(s_chcreate_overlay);
+    lv_obj_remove_style_all(card);
+    lv_obj_set_size(card, SCR_W - 40, card_h);
+    // Sit just above the keyboard so both are visible.
+    lv_obj_set_pos(card, 20, SCR_H - keyboard_height() - card_h - 20);
+    lv_obj_set_style_bg_color(card, lv_color_hex(TH_SURFACE), 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(card, 12, 0);
+    lv_obj_set_style_pad_all(card, 16, 0);
+    lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    int y = 0;
+
+    lv_obj_t *title = lv_label_create(card);
+    lv_label_set_text(title, "New / join channel");
+    lv_obj_set_style_text_color(title, lv_color_hex(TH_TEXT), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_LEFT, 0, y);
+    y += 28;
+
+    s_chcreate_name = lv_textarea_create(card);
+    lv_obj_set_size(s_chcreate_name, lv_pct(100), 44);
+    lv_obj_align(s_chcreate_name, LV_ALIGN_TOP_LEFT, 0, y);
+    lv_textarea_set_one_line(s_chcreate_name, true);
+    lv_textarea_set_max_length(s_chcreate_name, 11);
+    lv_textarea_set_placeholder_text(s_chcreate_name, "Channel name (max 11 chars)");
+    lv_obj_set_style_bg_color(s_chcreate_name, lv_color_hex(TH_INPUT), 0);
+    lv_obj_set_style_text_color(s_chcreate_name, lv_color_hex(TH_TEXT), 0);
+    lv_obj_set_style_border_width(s_chcreate_name, 0, 0);
+    lv_obj_set_style_radius(s_chcreate_name, 8, 0);
+    lv_obj_set_style_anim_duration(s_chcreate_name, 0, LV_PART_CURSOR);
+    lv_obj_add_event_cb(s_chcreate_name, chcreate_focus_cb, LV_EVENT_FOCUSED, nullptr);
+    y += 50;
+
+    lv_obj_t *psk_hint = lv_label_create(card);
+    lv_label_set_text(psk_hint,
+                      "Key (base64). Blank = new random key. "
+                      "Type a key to join an existing channel.");
+    lv_label_set_long_mode(psk_hint, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(psk_hint, lv_pct(100));
+    lv_obj_set_style_text_color(psk_hint, lv_color_hex(TH_TEXT3), 0);
+    lv_obj_set_style_text_font(psk_hint, &lv_font_montserrat_16, 0);
+    lv_obj_align(psk_hint, LV_ALIGN_TOP_LEFT, 0, y);
+    y += 56;
+
+    s_chcreate_psk = lv_textarea_create(card);
+    lv_obj_set_size(s_chcreate_psk, lv_pct(100), 44);
+    lv_obj_align(s_chcreate_psk, LV_ALIGN_TOP_LEFT, 0, y);
+    lv_textarea_set_one_line(s_chcreate_psk, true);
+    lv_textarea_set_max_length(s_chcreate_psk, 64);
+    lv_textarea_set_placeholder_text(s_chcreate_psk, "(optional)  e.g. 1PG7OiApB1nwvP+rz05pAQ==");
+    lv_obj_set_style_bg_color(s_chcreate_psk, lv_color_hex(TH_INPUT), 0);
+    lv_obj_set_style_text_color(s_chcreate_psk, lv_color_hex(TH_TEXT), 0);
+    lv_obj_set_style_border_width(s_chcreate_psk, 0, 0);
+    lv_obj_set_style_radius(s_chcreate_psk, 8, 0);
+    lv_obj_set_style_anim_duration(s_chcreate_psk, 0, LV_PART_CURSOR);
+    lv_obj_add_event_cb(s_chcreate_psk, chcreate_focus_cb, LV_EVENT_FOCUSED, nullptr);
+    y += 50;
+
+    s_chcreate_status = lv_label_create(card);
+    lv_label_set_text(s_chcreate_status, "");
+    lv_obj_set_width(s_chcreate_status, lv_pct(100));
+    lv_label_set_long_mode(s_chcreate_status, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_color(s_chcreate_status, lv_color_hex(TH_TEXT3), 0);
+    lv_obj_set_style_text_font(s_chcreate_status, &lv_font_montserrat_16, 0);
+    lv_obj_align(s_chcreate_status, LV_ALIGN_TOP_LEFT, 0, y);
+
+    lv_obj_t *cancel = lv_button_create(card);
+    lv_obj_set_size(cancel, 130, 42);
+    lv_obj_align(cancel, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    lv_obj_set_style_bg_color(cancel, lv_color_hex(TH_INPUT), 0);
+    lv_obj_set_style_radius(cancel, 8, 0);
+    lv_obj_add_event_cb(cancel, chcreate_cancel_cb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t *cl = lv_label_create(cancel);
+    lv_label_set_text(cl, "Cancel");
+    lv_obj_set_style_text_color(cl, lv_color_hex(TH_TEXT), 0);
+    lv_obj_set_style_text_font(cl, &lv_font_montserrat_16, 0);
+    lv_obj_center(cl);
+
+    lv_obj_t *ok = lv_button_create(card);
+    lv_obj_set_size(ok, 130, 42);
+    lv_obj_align(ok, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+    lv_obj_set_style_bg_color(ok, lv_color_hex(TH_ACCENT), 0);
+    lv_obj_set_style_radius(ok, 8, 0);
+    lv_obj_add_event_cb(ok, chcreate_ok_cb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t *ol = lv_label_create(ok);
+    lv_label_set_text(ol, "Create / join");
+    lv_obj_set_style_text_color(ol, lv_color_hex(TH_TEXT), 0);
+    lv_obj_set_style_text_font(ol, &lv_font_montserrat_16, 0);
+    lv_obj_center(ol);
+
+    keyboard_attach(s_chcreate_name);
+    keyboard_show();
+    lv_textarea_set_cursor_pos(s_chcreate_name, LV_TEXTAREA_CURSOR_LAST);
+}
+
+// "+" FAB on the Chats tab. Refuses to open the modal when every secondary
+// channel slot is in use (the underlying channel_create would fail anyway).
+static void chats_fab_clicked_cb(lv_event_t *)
+{
+    bool has_room = false;
+    for (uint8_t i = 1; i < channels.getNumChannels(); i++) {
+        if (channels.getByIndex(i).role == meshtastic_Channel_Role_DISABLED) {
+            has_room = true;
+            break;
+        }
+    }
+    if (!has_room) {
+        LOG_WARN("mcui: chats FAB: no free secondary channel slot");
+        return;
+    }
+    chcreate_open();
 }
 
 // Add a section header label ("Channels" / "Direct")
@@ -205,8 +572,8 @@ static void add_chat_card(ChatEntry *ent, const char *subtitle, uint16_t unread,
     lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_set_user_data(card, ent);
     lv_obj_add_event_cb(card, chat_card_clicked, LV_EVENT_CLICKED, nullptr);
-    if (ent->id.kind == McConvId::DIRECT)
-        lv_obj_add_event_cb(card, chat_card_long_pressed, LV_EVENT_LONG_PRESSED, nullptr);
+    // Long-press is supported on both DMs and channels (handler distinguishes).
+    lv_obj_add_event_cb(card, chat_card_long_pressed, LV_EVENT_LONG_PRESSED, nullptr);
 
     // Round accent dot/avatar (first initial)
     lv_obj_t *dot = lv_obj_create(card);
@@ -320,7 +687,7 @@ static void rebuild_chats_list()
         char preview[80];
         fill_preview(ent->id, preview, sizeof(preview));
         uint16_t u = messages_unread(ent->id);
-        add_chat_card(ent, preview, u, TH_ACCENT);
+        add_chat_card(ent, preview, u, avatar_color_for(ent->id, ent->title));
     }
 
     // ---- Section 2: Direct conversations -----------------------------------
@@ -366,7 +733,7 @@ static void rebuild_chats_list()
         char preview[80];
         fill_preview(ent->id, preview, sizeof(preview));
         uint16_t u = messages_unread(ent->id);
-        add_chat_card(ent, preview, u, TH_BUBBLE_OUT);
+        add_chat_card(ent, preview, u, avatar_color_for(ent->id, ent->title));
     }
 
     s_chats_last_tick = messages_change_tick();
@@ -388,6 +755,25 @@ lv_obj_t *chats_screen_create(lv_obj_t *parent)
     lv_obj_set_flex_flow(s_chats_list, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_scroll_dir(s_chats_list, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(s_chats_list, LV_SCROLLBAR_MODE_AUTO);
+
+    // Floating action button: opens the "New / join channel" modal. Lives on
+    // the page (not the scroll list) so it stays put while the list scrolls.
+    lv_obj_t *fab = lv_button_create(s_chats_page);
+    lv_obj_set_size(fab, 56, 56);
+    lv_obj_align(fab, LV_ALIGN_BOTTOM_RIGHT, -16, -16);
+    lv_obj_set_style_bg_color(fab, lv_color_hex(TH_ACCENT), 0);
+    lv_obj_set_style_radius(fab, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_shadow_width(fab, 12, 0);
+    lv_obj_set_style_shadow_color(fab, lv_color_black(), 0);
+    lv_obj_set_style_shadow_opa(fab, LV_OPA_40, 0);
+    lv_obj_add_event_cb(fab, chats_fab_clicked_cb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_move_foreground(fab);
+
+    lv_obj_t *fab_lbl = lv_label_create(fab);
+    lv_label_set_text(fab_lbl, LV_SYMBOL_PLUS);
+    lv_obj_set_style_text_color(fab_lbl, lv_color_hex(TH_TEXT), 0);
+    lv_obj_set_style_text_font(fab_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_center(fab_lbl);
 
     // Note: the bubble chat view is created by McUI at root-screen level so
     // it can cover the tab bar area when the keyboard is up.

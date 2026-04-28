@@ -14,6 +14,10 @@
 #include <esp_heap_caps.h>
 #include <lvgl.h>
 
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/queue.h>
+
 namespace mcui {
 
 // Native panel = 800x480 landscape. We ask LovyanGFX to rotate it 90° via
@@ -27,16 +31,41 @@ static lv_indev_t *indev = nullptr;
 static lv_color_t *buf1 = nullptr;
 static lv_color_t *buf2 = nullptr;
 
-// ---- LVGL flush callback ---------------------------------------------------
-// Area is in the logical mcui coordinate space. LovyanGFX's rotation
-// transforms the coordinates into the physical 800x480
-// framebuffer automatically.
+// ---- LVGL flush pipeline ---------------------------------------------------
+// Render runs on the UI task (core 0). The actual pushImage (rotated
+// SRAM->PSRAM copy via LovyanGFX) runs on a worker task pinned to core 1,
+// so per-frame wall time is max(render, copy) instead of render + copy.
+//
+// flush_cb is the LVGL-facing entry point: it just enqueues the chunk and
+// returns. Queue depth 1 matches LVGL's two-buffer flow (only one flush in
+// flight at a time) and provides natural backpressure via blocking enqueue
+// when the worker is still busy with the previous chunk.
+//
+// Coordinates are in the logical (rotated) mcui space; LovyanGFX transforms
+// them into the physical 800x480 framebuffer automatically.
+struct flush_msg_t {
+    lv_display_t *d;
+    lv_area_t     area;
+    uint8_t      *px_map;
+};
+static QueueHandle_t s_flush_q = nullptr;
+
+static void flush_worker_task(void *)
+{
+    flush_msg_t m;
+    for (;;) {
+        if (xQueueReceive(s_flush_q, &m, portMAX_DELAY) != pdTRUE) continue;
+        const int32_t w = m.area.x2 - m.area.x1 + 1;
+        const int32_t h = m.area.y2 - m.area.y1 + 1;
+        gfx->pushImageDMA(m.area.x1, m.area.y1, w, h, reinterpret_cast<uint16_t *>(m.px_map));
+        lv_display_flush_ready(m.d);
+    }
+}
+
 static void flush_cb(lv_display_t *d, const lv_area_t *area, uint8_t *px_map)
 {
-    const int32_t w = area->x2 - area->x1 + 1;
-    const int32_t h = area->y2 - area->y1 + 1;
-    gfx->pushImageDMA(area->x1, area->y1, w, h, reinterpret_cast<uint16_t *>(px_map));
-    lv_display_flush_ready(d);
+    flush_msg_t m = { d, *area, px_map };
+    xQueueSend(s_flush_q, &m, portMAX_DELAY);
 }
 
 // ---- LVGL indev (touch) callback ------------------------------------------
@@ -102,34 +131,44 @@ void display_init()
              (int)gfx->width(), (int)gfx->height(),
              landscape_active() ? "landscape" : "portrait");
 
+    // ---- Flush worker on core 1 ----
+    // The UI task (this one) runs on core 0 and does LVGL render. The worker
+    // on core 1 does the rotated SRAM->PSRAM copy in parallel, so per-frame
+    // wall time becomes max(render, copy) instead of render + copy.
+    // Queue depth 1 matches LVGL's two-buffer flow (only one flush in flight).
+    s_flush_q = xQueueCreate(1, sizeof(flush_msg_t));
+    xTaskCreatePinnedToCore(flush_worker_task, "lcdflush", 4096,
+                            nullptr, 2, nullptr, 1);
+
     // ---- LVGL core ----
     lv_init();
     lv_tick_set_cb(reinterpret_cast<lv_tick_get_cb_t>(millis));
 
     // ---- Draw buffers ----
-    // Two partial buffers, each SCR_W wide x 200 rows in PSRAM. This
-    // matches MeshCore's crowpanel_lvgl_chat reference (~96000 pixels each).
-    // A bigger buffer means fewer flush round-trips per refresh, which is
-    // the dominant cost on this panel — notably the keyboard redraw shrinks
-    // from ~4 flushes to 2, and textarea edits land in a single flush. This
-    // is THE critical perf knob for typing responsiveness.
-    constexpr uint32_t BUF_LINES = 200;
-    size_t bufBytes = (size_t)SCR_W * BUF_LINES * sizeof(lv_color_t);
+    // Prefer internal SRAM (DMA-capable) over PSRAM. The RGB panel streams
+    // its 768 KB framebuffer from PSRAM continuously at the pixel clock, so
+    // PSRAM-resident draw buffers stall LVGL render and the flush copy on
+    // every read and write. SRAM buffers eliminate that contention.
+    //
+    // 80 rows × SCR_W × 2 ≈ 77 KB per buffer, ~154 KB total — fits comfortably
+    // in the S3's free internal heap. Falls back to bigger PSRAM buffers if
+    // SRAM alloc fails (better than failing the boot).
+    constexpr uint32_t BUF_LINES_SRAM  = 80;
+    constexpr uint32_t BUF_LINES_PSRAM = 200;
+    size_t bufBytes = (size_t)SCR_W * BUF_LINES_SRAM * sizeof(lv_color_t);
 
-    buf1 = static_cast<lv_color_t *>(heap_caps_aligned_alloc(32, bufBytes, MALLOC_CAP_SPIRAM));
-    buf2 = static_cast<lv_color_t *>(heap_caps_aligned_alloc(32, bufBytes, MALLOC_CAP_SPIRAM));
+    buf1 = static_cast<lv_color_t *>(heap_caps_aligned_alloc(32, bufBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+    buf2 = static_cast<lv_color_t *>(heap_caps_aligned_alloc(32, bufBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
     if (!buf1 || !buf2) {
-        LOG_ERROR("mcui: PSRAM draw buffer alloc failed (%u bytes each), falling back",
-                  (unsigned)bufBytes);
-        // Release whichever side did succeed (don't leak a half-allocation).
+        LOG_WARN("mcui: internal SRAM draw buffer alloc failed (%u bytes each), falling back to PSRAM",
+                 (unsigned)bufBytes);
         if (buf1) { heap_caps_free(buf1); buf1 = nullptr; }
         if (buf2) { heap_caps_free(buf2); buf2 = nullptr; }
-        // Fallback: 40 rows × 480 × 2 ≈ 38 KB in internal DMA-capable RAM.
-        bufBytes = (size_t)SCR_W * 40 * sizeof(lv_color_t);
-        buf1 = static_cast<lv_color_t *>(heap_caps_aligned_alloc(32, bufBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
-        buf2 = static_cast<lv_color_t *>(heap_caps_aligned_alloc(32, bufBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+        bufBytes = (size_t)SCR_W * BUF_LINES_PSRAM * sizeof(lv_color_t);
+        buf1 = static_cast<lv_color_t *>(heap_caps_aligned_alloc(32, bufBytes, MALLOC_CAP_SPIRAM));
+        buf2 = static_cast<lv_color_t *>(heap_caps_aligned_alloc(32, bufBytes, MALLOC_CAP_SPIRAM));
         if (!buf1 || !buf2) {
-            LOG_ERROR("mcui: internal draw buffer alloc failed (%u bytes each)",
+            LOG_ERROR("mcui: PSRAM draw buffer alloc also failed (%u bytes each)",
                       (unsigned)bufBytes);
             if (buf1) { heap_caps_free(buf1); buf1 = nullptr; }
             if (buf2) { heap_caps_free(buf2); buf2 = nullptr; }

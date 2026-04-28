@@ -36,4 +36,22 @@
 // ---- Badge ----
 #define TH_BADGE_BG     0xE05555
 
+// ---- Avatar palette ----
+// Used by avatar_color_for() in McScreens.cpp to deterministically pick a
+// stable colored circle per conversation (channel or DM).
+#define TH_AVATAR_PALETTE_COUNT 12
+#define TH_AVATAR_PALETTE_LIST  \
+    0x3390EC, \
+    0x4CAF50, \
+    0xAB47BC, \
+    0xFF7043, \
+    0x26A69A, \
+    0xEC407A, \
+    0xFFB300, \
+    0x5C6BC0, \
+    0x29B6F6, \
+    0xEF5350, \
+    0x9CCC65, \
+    0x8D6E63
+
 #endif // HAS_TFT && USE_MCUI

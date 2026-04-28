@@ -1890,19 +1890,6 @@ static void refresh_values()
 
 static void rebuild_settings()
 {
-    // -------- About --------
-    add_section_header("About");
-    lv_obj_t *about = add_card();
-    s_lbl_firmware   = add_info_row(about, "Firmware",  optstr(APP_VERSION));
-    s_lbl_owner      = add_info_row(about, "Owner",     "-");
-    s_lbl_nodeid     = add_info_row(about, "Node ID",   "-");
-    s_lbl_region_now = add_info_row(about, "Region",    "-");
-    s_lbl_preset_now = add_info_row(about, "Preset",    "-");
-    s_lbl_uptime     = add_info_row(about, "Uptime",    "-");
-    s_lbl_heap       = add_info_row(about, "Free heap", "-");
-    s_lbl_battery    = add_info_row(about, "Battery",   "-");
-    s_lbl_noise      = add_info_row(about, "Noise floor", "-");
-
     // -------- Owner (tap to edit) --------
     add_section_header("Owner");
     lv_obj_t *owner_card = add_card();
@@ -2059,6 +2046,19 @@ static void rebuild_settings()
         lv_obj_center(bl);
     }
     add_card_hint(net, "First setup scans first, then saves and reboots after the password.");
+
+    // -------- About --------
+    add_section_header("About");
+    lv_obj_t *about = add_card();
+    s_lbl_firmware   = add_info_row(about, "Firmware",  optstr(APP_VERSION));
+    s_lbl_owner      = add_info_row(about, "Owner",     "-");
+    s_lbl_nodeid     = add_info_row(about, "Node ID",   "-");
+    s_lbl_region_now = add_info_row(about, "Region",    "-");
+    s_lbl_preset_now = add_info_row(about, "Preset",    "-");
+    s_lbl_uptime     = add_info_row(about, "Uptime",    "-");
+    s_lbl_heap       = add_info_row(about, "Free heap", "-");
+    s_lbl_battery    = add_info_row(about, "Battery",   "-");
+    s_lbl_noise      = add_info_row(about, "Noise floor", "-");
 
     // -------- Actions --------
     add_section_header("Actions");
