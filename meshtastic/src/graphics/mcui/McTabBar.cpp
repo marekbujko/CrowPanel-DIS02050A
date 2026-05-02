@@ -73,7 +73,7 @@ lv_obj_t *tabbar_create(lv_obj_t *parent)
         lv_obj_align(s_marker[i], LV_ALIGN_TOP_MID, 0, 4);
         lv_obj_set_style_bg_color(s_marker[i], lv_color_hex(TH_TAB_ACTIVE), 0);
         lv_obj_set_style_bg_opa(s_marker[i], LV_OPA_TRANSP, 0);
-        lv_obj_set_style_radius(s_marker[i], 2, 0);
+        lv_obj_set_style_radius(s_marker[i], 0, 0);
 
         // Icon
         s_icon[i] = lv_label_create(s_btn[i]);

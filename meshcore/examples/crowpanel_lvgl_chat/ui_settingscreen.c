@@ -33,6 +33,7 @@ lv_obj_t * ui_repeatersbutton     = NULL;   // NULL — removed (tab handles it)
 lv_obj_t * ui_Label2              = NULL;
 lv_obj_t * ui_purgedatabutton     = NULL;
 lv_obj_t * ui_Label21             = NULL;
+lv_obj_t * ui_rebootappbutton     = NULL;
 lv_obj_t * ui_renamebox           = NULL;
 lv_obj_t * ui_timezonedropdown    = NULL;
 lv_obj_t * ui_txpowerslider       = NULL;
@@ -438,6 +439,8 @@ void ui_settingscreen_screen_init(void) {
 
     ui_purgedatabutton = make_action_btn(form, &ui_Label21, lv_pct(100), 48);
     lv_obj_set_style_bg_color(ui_purgedatabutton, lv_color_hex(TH_RED), 0);
+    ui_rebootappbutton = make_action_btn(form, NULL, lv_pct(100), 48);
+    lv_obj_set_style_bg_color(ui_rebootappbutton, lv_color_hex(TH_RED), 0);
 
     // ══════════════════════════════════════════════════════════
     // FEATURES & BRIDGES

@@ -6,7 +6,7 @@
 //   - Monitors an idle timer and switches the backlight off after it expires
 //
 // Clients (LVGL touch callback, incoming-message observer, settings UI) poke
-// the backlight via the three calls below. All are lock-free: the task reads
+// the backlight via the calls below. All are lock-free: the task reads
 // `volatile` flags on each iteration.
 //
 // DESIGN NOTE — "why no GT911 polling here":
@@ -27,10 +27,16 @@
 extern "C" {
 #endif
 
-// Record any user activity (touch, incoming message, etc.). Resets the idle
-// timer. If the screen is currently asleep, schedules a soft wake on the
-// backlight task. Safe to call from any thread / ISR-free context.
+// Record direct user activity such as touch input. Resets the idle timer.
+// If the screen is currently asleep, schedules a soft wake on the backlight
+// task. Safe to call from any thread / ISR-free context.
 void backlight_notify_activity(void);
+
+// Request a wake for passive external events such as a newly received
+// message. Unlike backlight_notify_activity(), this does not refresh the
+// idle timer while the screen is already on, so background traffic cannot
+// keep the display awake indefinitely.
+void backlight_wake_if_off(void);
 
 // True when the backlight is currently on. Used by LVGL's touch_cb to
 // decide whether a tap should also be delivered as a UI event or swallowed

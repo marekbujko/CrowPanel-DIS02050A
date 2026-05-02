@@ -196,6 +196,9 @@ static void ui_task(void *)
     LOG_INFO("mcui: UI built, entering main loop");
 
     uint32_t next_status_refresh = 0;
+    uint32_t next_observer_attach_try = 0;
+    uint32_t next_screen_tick = 0;
+    uint32_t next_save_tick = 0;
     while (true) {
         lv_timer_handler();
 
@@ -203,32 +206,41 @@ static void ui_task(void *)
         // The first few calls usually no-op because textMessageModule hasn't
         // been constructed yet (tftSetup runs before setupModules). We retry
         // every tick until attached.
-        observer_init();
+        uint32_t now = millis();
+        if ((int32_t)(now - next_observer_attach_try) >= 0) {
+            observer_init();
+            next_observer_attach_try = now + 250;
+        }
 
         // Only tick the visible screen. Hidden screen rebuilds are surprisingly
         // expensive on RGB panels and do not help the radio recover after IRQs.
-        if (s_active_tab == TAB_CHATS) {
-            chats_screen_tick();
-        } else {
-            if (chatview_is_open())
-                chatview_tick();
-            if (s_active_tab == TAB_NODES)
-                nodes_screen_tick();
-            else if (s_active_tab == TAB_MAPS)
-                maps_screen_tick();
-            else if (s_active_tab == TAB_SETTINGS)
-                settings_screen_tick();
+        if ((int32_t)(now - next_screen_tick) >= 0) {
+            if (s_active_tab == TAB_CHATS) {
+                chats_screen_tick();
+            } else {
+                if (chatview_is_open())
+                    chatview_tick();
+                if (s_active_tab == TAB_NODES)
+                    nodes_screen_tick();
+                else if (s_active_tab == TAB_MAPS)
+                    maps_screen_tick();
+                else if (s_active_tab == TAB_SETTINGS)
+                    settings_screen_tick();
+            }
+            next_screen_tick = now + 16;
         }
         // Throttled flush of chat history to flash when dirty.
-        messages_save_tick();
+        if ((int32_t)(now - next_save_tick) >= 0) {
+            messages_save_tick();
+            next_save_tick = now + 200;
+        }
 
-        uint32_t now = millis();
         if ((int32_t)(now - next_status_refresh) >= 0) {
             statusbar_refresh();
             next_status_refresh = now + 1000;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(5));
+        vTaskDelay(pdMS_TO_TICKS(6));
     }
 }
 

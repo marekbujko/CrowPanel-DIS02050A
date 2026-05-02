@@ -446,8 +446,10 @@ void init_display_and_ui() {
   // flush copy don't fight the LCD GDMA for PSRAM bandwidth. The RGB panel
   // streams its 768 KB framebuffer from PSRAM continuously, so PSRAM-resident
   // draw buffers stall on every read and write.
-  int buf_rows = 38400 / SCR_W;       // 80 portrait, 48 landscape (~77 KB each in SRAM)
-  int buf_rows_psram = 96000 / SCR_W; // fallback: 200 portrait, 120 landscape
+  // Keep internal draw buffers modest so WiFi can still initialize later.
+  // 16KB per buffer internal DMA target.
+  int buf_rows = 16384 / SCR_W;       // 34 portrait, 20 landscape (~32 KB total)
+  int buf_rows_psram = 65536 / SCR_W; // fallback: 136 portrait, 81 landscape
   buf0 = (lv_color_t*)heap_caps_malloc(SCR_W * buf_rows * sizeof(lv_color_t), MALLOC_CAP_INTERNAL|MALLOC_CAP_DMA);
   buf1 = (lv_color_t*)heap_caps_malloc(SCR_W * buf_rows * sizeof(lv_color_t), MALLOC_CAP_INTERNAL|MALLOC_CAP_DMA);
   if (!buf0 || !buf1) {
@@ -528,6 +530,10 @@ void init_display_and_ui() {
     lv_obj_set_style_bg_color(ui_purgedatabutton, lv_color_hex(g_theme->btn_danger),
                               LV_PART_MAIN | LV_STATE_DEFAULT);
   }
+  if (ui_rebootappbutton) {
+    lv_obj_set_style_bg_color(ui_rebootappbutton, lv_color_hex(g_theme->btn_danger),
+                              LV_PART_MAIN | LV_STATE_DEFAULT);
+  }
   if (ui_Label9) {
     lv_label_set_text(ui_Label9, LV_SYMBOL_UPLOAD "\nFlood-Advert");
     lv_obj_set_style_text_align(ui_Label9, LV_TEXT_ALIGN_CENTER, 0);
@@ -542,6 +548,7 @@ void init_display_and_ui() {
   if (ui_Label11) lv_label_set_text(ui_Label11, LV_SYMBOL_CALL     "\nAuto Contacts");
   if (ui_Label20) lv_label_set_text(ui_Label20, LV_SYMBOL_BELL " Notify");
   btn_lbl(ui_purgedatabutton,   LV_SYMBOL_TRASH "\nPurge Data");
+  btn_lbl(ui_rebootappbutton,   LV_SYMBOL_POWER "\nReboot");
   btn_lbl(ui_repeatersbutton,   LV_SYMBOL_WIFI  "\nRepeaters");
   btn_lbl(ui_autorepeatertoggle, LV_SYMBOL_WIFI " Auto add Repeaters");
   btn_lbl(ui_autocontacttoggle,  LV_SYMBOL_CALL " Auto add Contacts");

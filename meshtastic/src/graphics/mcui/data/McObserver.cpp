@@ -19,10 +19,6 @@ class TextObserver : public Observer<const meshtastic_MeshPacket *>
   public:
     int onNotify(const meshtastic_MeshPacket *mp) override
     {
-        LOG_DEBUG("mcui: observer onNotify from=0x%x to=0x%x port=%d",
-                  mp ? (unsigned)mp->from : 0,
-                  mp ? (unsigned)mp->to : 0,
-                  mp ? (int)mp->decoded.portnum : -1);
         if (!mp || !nodeDB) return 0;
 
         // Cache last-heard RSSI from any packet we can observe, even if it
@@ -60,9 +56,9 @@ class TextObserver : public Observer<const meshtastic_MeshPacket *>
                  id.kind == McConvId::DIRECT ? "node" : "ch",
                  (unsigned)id.value);
         // Wake the screen so the user sees the new message without having
-        // to tap first. Lock-free: just flips a flag the backlight task
-        // picks up.
-        backlight_notify_activity();
+        // to tap first, but do not treat mesh traffic as ongoing user
+        // activity or it will keep extending the sleep timer indefinitely.
+        backlight_wake_if_off();
         return 0; // let other handlers also run
     }
 };

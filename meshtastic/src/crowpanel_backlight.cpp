@@ -21,11 +21,17 @@
 #include <freertos/task.h>
 #include <freertos/semphr.h>
 
+#if HAS_TFT && USE_MCUI
+#include "graphics/mcui/McDisplay.h"
+#endif
+
 static constexpr uint8_t  BL_I2C_ADDR = 0x30;
 static constexpr uint8_t  TOUCH_I2C_ADDR = 0x5D;
-static constexpr uint8_t  BL_OFF = 0x05;
-static constexpr uint8_t  BL_MAX = 0x10;
-static constexpr uint8_t  BL_TOUCH_WAKE = 0x19;
+static constexpr uint8_t  BL_V11_OFF = 0x05;
+static constexpr uint8_t  BL_V11_MIN = 0x06;
+static constexpr uint8_t  BL_V11_MAX = 0x10;
+static constexpr uint8_t  BL_V11_TOUCH_WAKE = 0x19;
+static constexpr uint8_t  BL_V12_OFF = 245;
 static constexpr uint32_t DEFAULT_TIMEOUT_SECS = 30;
 static constexpr uint32_t SOFT_WAKE_MS = 1500;
 static constexpr uint32_t STARTUP_GRACE_MS = 5000;
@@ -51,6 +57,16 @@ static void _bl_cmd(uint8_t cmd) {
     if (s_wire_lock) xSemaphoreGive(s_wire_lock);
 }
 
+// Elecrow changed the 0x30 backlight protocol between board revisions.
+// Older boards use the small v1.1 command set (0x05..0x10), while newer
+// boards use a linear brightness scale where 0 is brightest and 245 is off.
+// Drive both so the same firmware works across silent hardware batches.
+static void _bl_cmd_compat(uint8_t v11_cmd, uint8_t v12_cmd)
+{
+    _bl_cmd(v11_cmd);
+    _bl_cmd(v12_cmd);
+}
+
 // ---------------------------------------------------------------------------
 // State, shared lock-free between the backlight task (core 1), LVGL touch
 // cb (core 0) and the mesh RX observer (core 1). All writes and reads are
@@ -69,8 +85,8 @@ static volatile uint32_t s_timeout_secs     = DEFAULT_TIMEOUT_SECS;
 // Runs exclusively on the backlight task, so it can safely call delay().
 // ---------------------------------------------------------------------------
 static void _bl_soft_wake() {
-    const uint8_t start = BL_OFF + 1;
-    const uint8_t end   = BL_MAX;
+    const uint8_t start = BL_V11_MIN;
+    const uint8_t end   = BL_V11_MAX;
     const uint8_t steps = end - start;
 
     for (uint8_t i = 0; i <= steps; i++) {
@@ -88,6 +104,13 @@ static void _bl_soft_wake() {
 extern "C" void backlight_notify_activity(void) {
     s_last_activity_ms = millis();
     if (!s_screen_on) s_wake_requested = true;
+}
+
+extern "C" void backlight_wake_if_off(void) {
+    if (!s_screen_on) {
+        s_last_activity_ms = millis();
+        s_wake_requested = true;
+    }
 }
 
 extern "C" bool backlight_is_screen_on(void) {
@@ -120,6 +143,9 @@ static void backlight_task(void *) {
         if (s_wake_requested) {
             s_wake_requested = false;
             if (!s_screen_on) {
+#if HAS_TFT && USE_MCUI
+                mcui::display_wake_panel();
+#endif
                 _bl_soft_wake();
                 s_screen_on = true;
             }
@@ -131,7 +157,10 @@ static void backlight_task(void *) {
         if (to != UINT32_MAX && s_screen_on) {
             uint32_t elapsed = millis() - s_last_activity_ms;
             if (elapsed >= to * 1000U) {
-                _bl_cmd(BL_OFF);
+                _bl_cmd_compat(BL_V11_OFF, BL_V12_OFF);
+#if HAS_TFT && USE_MCUI
+                mcui::display_sleep_panel();
+#endif
                 s_screen_on = false;
             }
         }
@@ -181,7 +210,7 @@ extern "C" void initVariant() {
 
     for (int i = 0; i < PROBE_ATTEMPTS; i++) {
         if (_i2c_probe(BL_I2C_ADDR) && _i2c_probe(TOUCH_I2C_ADDR)) break;
-        _bl_cmd(BL_TOUCH_WAKE);
+        _bl_cmd(BL_V11_TOUCH_WAKE);
         pinMode(1, OUTPUT);
         digitalWrite(1, LOW);
         delay(120);

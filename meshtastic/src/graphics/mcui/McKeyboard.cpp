@@ -190,7 +190,7 @@ lv_obj_t *keyboard_create(lv_obj_t *parent)
     lv_obj_set_style_bg_opa(s_kb, LV_OPA_COVER, LV_PART_ITEMS);
     lv_obj_set_style_text_color(s_kb, lv_color_hex(TH_TEXT), LV_PART_ITEMS);
     lv_obj_set_style_text_font(s_kb, &lv_font_montserrat_16, LV_PART_ITEMS);
-    lv_obj_set_style_radius(s_kb, 8, LV_PART_ITEMS);
+    lv_obj_set_style_radius(s_kb, 0, LV_PART_ITEMS);
     lv_obj_set_style_border_width(s_kb, 0, LV_PART_ITEMS);
 
     // Pressed state

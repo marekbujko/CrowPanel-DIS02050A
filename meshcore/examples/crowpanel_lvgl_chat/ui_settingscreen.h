@@ -35,6 +35,7 @@ extern lv_obj_t * ui_Label18;
 extern lv_obj_t * ui_repeatersbutton;
 extern lv_obj_t * ui_Label2;
 extern lv_obj_t * ui_purgedatabutton;
+extern lv_obj_t * ui_rebootappbutton;
 extern lv_obj_t * ui_Label21;
 extern lv_obj_t * ui_renamebox;
 extern lv_obj_t * ui_timezonedropdown;

@@ -30,6 +30,12 @@ static lv_display_t *disp = nullptr;
 static lv_indev_t *indev = nullptr;
 static lv_color_t *buf1 = nullptr;
 static lv_color_t *buf2 = nullptr;
+static bool s_touch_was_pressed = false;
+static bool s_touch_swallow_until_release = false;
+static bool s_touch_release_required_for_wake = false;
+static bool s_last_screen_on = true;
+static int32_t s_last_touch_x = 0;
+static int32_t s_last_touch_y = 0;
 
 // ---- LVGL flush pipeline ---------------------------------------------------
 // Render runs on the UI task (core 0). The actual pushImage (rotated
@@ -43,29 +49,12 @@ static lv_color_t *buf2 = nullptr;
 //
 // Coordinates are in the logical (rotated) mcui space; LovyanGFX transforms
 // them into the physical 800x480 framebuffer automatically.
-struct flush_msg_t {
-    lv_display_t *d;
-    lv_area_t     area;
-    uint8_t      *px_map;
-};
-static QueueHandle_t s_flush_q = nullptr;
-
-static void flush_worker_task(void *)
-{
-    flush_msg_t m;
-    for (;;) {
-        if (xQueueReceive(s_flush_q, &m, portMAX_DELAY) != pdTRUE) continue;
-        const int32_t w = m.area.x2 - m.area.x1 + 1;
-        const int32_t h = m.area.y2 - m.area.y1 + 1;
-        gfx->pushImageDMA(m.area.x1, m.area.y1, w, h, reinterpret_cast<uint16_t *>(m.px_map));
-        lv_display_flush_ready(m.d);
-    }
-}
-
 static void flush_cb(lv_display_t *d, const lv_area_t *area, uint8_t *px_map)
 {
-    flush_msg_t m = { d, *area, px_map };
-    xQueueSend(s_flush_q, &m, portMAX_DELAY);
+    const int32_t w = area->x2 - area->x1 + 1;
+    const int32_t h = area->y2 - area->y1 + 1;
+    gfx->pushImage(area->x1, area->y1, w, h, reinterpret_cast<uint16_t *>(px_map));
+    lv_display_flush_ready(d);
 }
 
 // ---- LVGL indev (touch) callback ------------------------------------------
@@ -83,6 +72,7 @@ static void flush_cb(lv_display_t *d, const lv_area_t *area, uint8_t *px_map)
 // was sitting under the user's finger before the screen went dark.
 static void touch_cb(lv_indev_t *drv, lv_indev_data_t *data)
 {
+    constexpr int32_t TOUCH_ACTIVITY_MOVE_PX = 8;
     int32_t x = 0, y = 0;
     // GT911 touch lives on the same Wire bus as the 0x30 backlight
     // controller that the backlight task writes to from core 1.
@@ -92,10 +82,50 @@ static void touch_cb(lv_indev_t *drv, lv_indev_data_t *data)
     backlight_i2c_lock();
     bool pressed = gfx->getTouch(&x, &y);
     backlight_i2c_unlock();
+    bool screen_on = backlight_is_screen_on();
+    if (!screen_on && s_last_screen_on) {
+        s_touch_release_required_for_wake = true;
+    }
+    s_last_screen_on = screen_on;
+    if (!screen_on) {
+        if (!pressed) {
+            s_touch_was_pressed = false;
+            s_touch_release_required_for_wake = false;
+            s_touch_swallow_until_release = false;
+        } else if (!s_touch_release_required_for_wake) {
+            backlight_notify_activity();
+            s_touch_swallow_until_release = true;
+            s_touch_release_required_for_wake = true;
+            s_touch_was_pressed = true;
+            s_last_touch_x = x;
+            s_last_touch_y = y;
+        }
+        data->state = LV_INDEV_STATE_RELEASED;
+        return;
+    }
+    if (s_touch_swallow_until_release) {
+        if (!pressed) {
+            s_touch_swallow_until_release = false;
+            s_touch_was_pressed = false;
+        }
+        data->state = LV_INDEV_STATE_RELEASED;
+        return;
+    }
     if (pressed) {
-        // Always note activity so the idle timer resets and the screen
-        // wakes even if we end up swallowing this particular press event.
-        backlight_notify_activity();
+        bool new_press = !s_touch_was_pressed;
+        bool moved =
+            (abs(x - s_last_touch_x) >= TOUCH_ACTIVITY_MOVE_PX) ||
+            (abs(y - s_last_touch_y) >= TOUCH_ACTIVITY_MOVE_PX);
+
+        // Refresh the idle timer only for a new press or meaningful finger
+        // movement. This prevents a noisy/stuck touch state from keeping the
+        // display awake by retriggering on every LVGL poll.
+        if (new_press || moved) {
+            backlight_notify_activity();
+        }
+        s_touch_was_pressed = true;
+        s_last_touch_x = x;
+        s_last_touch_y = y;
 
         if (!backlight_is_screen_on()) {
             // Screen was off — this tap's only job is to wake it.
@@ -111,8 +141,25 @@ static void touch_cb(lv_indev_t *drv, lv_indev_data_t *data)
         data->point.y = y;
         data->state = LV_INDEV_STATE_PRESSED;
     } else {
+        s_touch_was_pressed = false;
         data->state = LV_INDEV_STATE_RELEASED;
     }
+}
+
+void display_sleep_panel()
+{
+    if (!gfx) return;
+    backlight_i2c_lock();
+    gfx->sleep();
+    backlight_i2c_unlock();
+}
+
+void display_wake_panel()
+{
+    if (!gfx) return;
+    backlight_i2c_lock();
+    gfx->wakeup();
+    backlight_i2c_unlock();
 }
 
 void display_init()
@@ -131,15 +178,6 @@ void display_init()
              (int)gfx->width(), (int)gfx->height(),
              landscape_active() ? "landscape" : "portrait");
 
-    // ---- Flush worker on core 1 ----
-    // The UI task (this one) runs on core 0 and does LVGL render. The worker
-    // on core 1 does the rotated SRAM->PSRAM copy in parallel, so per-frame
-    // wall time becomes max(render, copy) instead of render + copy.
-    // Queue depth 1 matches LVGL's two-buffer flow (only one flush in flight).
-    s_flush_q = xQueueCreate(1, sizeof(flush_msg_t));
-    xTaskCreatePinnedToCore(flush_worker_task, "lcdflush", 4096,
-                            nullptr, 2, nullptr, 1);
-
     // ---- LVGL core ----
     lv_init();
     lv_tick_set_cb(reinterpret_cast<lv_tick_get_cb_t>(millis));
@@ -153,8 +191,12 @@ void display_init()
     // 80 rows × SCR_W × 2 ≈ 77 KB per buffer, ~154 KB total — fits comfortably
     // in the S3's free internal heap. Falls back to bigger PSRAM buffers if
     // SRAM alloc fails (better than failing the boot).
-    constexpr uint32_t BUF_LINES_SRAM  = 80;
-    constexpr uint32_t BUF_LINES_PSRAM = 200;
+    const bool is_landscape = landscape_active();
+    // Landscape has wider lines (800 px), so using the same line count as
+    // portrait can inflate buffer size and hurt allocator/flush behavior.
+    // Keep per-buffer footprint closer across orientations.
+    const uint32_t BUF_LINES_SRAM  = is_landscape ? 72 : 120;
+    const uint32_t BUF_LINES_PSRAM = is_landscape ? 160 : 260;
     size_t bufBytes = (size_t)SCR_W * BUF_LINES_SRAM * sizeof(lv_color_t);
 
     buf1 = static_cast<lv_color_t *>(heap_caps_aligned_alloc(32, bufBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
@@ -181,6 +223,7 @@ void display_init()
     disp = lv_display_create(SCR_W, SCR_H);
     lv_display_set_flush_cb(disp, flush_cb);
     lv_display_set_buffers(disp, buf1, buf2, bufBytes, LV_DISPLAY_RENDER_MODE_PARTIAL);
+    lv_display_set_antialiasing(disp, false);
     // No lv_display_set_rotation() — the panel is already rotated at the
     // LovyanGFX level, so LVGL renders directly into the current logical space.
 
@@ -189,6 +232,14 @@ void display_init()
     lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
     lv_indev_set_read_cb(indev, touch_cb);
     lv_indev_set_display(indev, disp);
+    // Faster input sampling and tighter scroll thresholds improve perceived
+    // smoothness on drag-heavy screens.
+    lv_indev_set_scroll_limit(indev, 6);
+    lv_indev_set_scroll_throw(indev, 24);
+    lv_timer_t *indev_timer = lv_indev_get_read_timer(indev);
+    if (indev_timer) {
+        lv_timer_set_period(indev_timer, landscape_active() ? 12 : 10);
+    }
     // Long-press threshold is short enough for node context menus to feel
     // responsive, but still comfortably above normal tap/typing timing.
     // Keeps quick taps from ever entering long-press state — important for keyboards,
@@ -196,13 +247,13 @@ void display_init()
     // and interact badly with auto-repeat.
     lv_indev_set_long_press_time(indev, 700);
 
-    // Tune the display refresh timer to 20 ms period (50 Hz). LVGL's default
-    // LV_DEF_REFR_PERIOD is 33 ms (~30 Hz) which feels sluggish on this
-    // panel for typing-speed edits. Avoid pushing faster than the RGB panel
-    // scanout; that causes visible tearing/ghosting on this hardware.
+    // Orientation-specific refresh cadence:
+    // - portrait can usually hold ~60 Hz well
+    // - landscape often benefits from a slightly lower refresh period on this
+    //   RGB panel path to reduce visible tearing during long drags
     lv_timer_t *refr_timer = lv_display_get_refr_timer(disp);
     if (refr_timer) {
-        lv_timer_set_period(refr_timer, 20);
+        lv_timer_set_period(refr_timer, is_landscape ? 20 : 16);
     }
 
     // Apply the persisted screen-sleep timeout from Meshtastic config to the

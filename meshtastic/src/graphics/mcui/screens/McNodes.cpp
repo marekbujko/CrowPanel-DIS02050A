@@ -45,8 +45,9 @@ struct NodeEntry {
     char line3_text[80];
 };
 static constexpr int MAX_NODE_CARDS = 64;
-static constexpr uint32_t NODE_DYNAMIC_REFRESH_MS = 5000;
+static constexpr uint32_t NODE_DYNAMIC_REFRESH_MS = 8000;
 static constexpr uint32_t NODE_FULL_REBUILD_MS = 60000;
+static bool s_nodes_rebuild_pending = false;
 static NodeEntry s_entries[MAX_NODE_CARDS];
 static int s_num_entries = 0;
 
@@ -213,7 +214,7 @@ static void traceroute_popup_open(NodeNum node, const char *title)
     lv_obj_set_size(s_node_menu_overlay, SCR_W, SCR_H);
     lv_obj_set_pos(s_node_menu_overlay, 0, 0);
     lv_obj_set_style_bg_color(s_node_menu_overlay, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(s_node_menu_overlay, LV_OPA_60, 0);
+    lv_obj_set_style_bg_opa(s_node_menu_overlay, LV_OPA_TRANSP, 0);
     lv_obj_remove_flag(s_node_menu_overlay, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_move_foreground(s_node_menu_overlay);
 
@@ -223,7 +224,7 @@ static void traceroute_popup_open(NodeNum node, const char *title)
     lv_obj_center(card);
     lv_obj_set_style_bg_color(card, lv_color_hex(TH_SURFACE), 0);
     lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(card, 14, 0);
+    lv_obj_set_style_radius(card, 0, 0);
     lv_obj_set_style_pad_all(card, 16, 0);
     lv_obj_set_style_pad_row(card, 10, 0);
     lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
@@ -248,7 +249,7 @@ static void traceroute_popup_open(NodeNum node, const char *title)
     lv_obj_t *close = lv_button_create(card);
     lv_obj_set_size(close, lv_pct(100), 46);
     lv_obj_set_style_bg_color(close, lv_color_hex(TH_INPUT), 0);
-    lv_obj_set_style_radius(close, 10, 0);
+    lv_obj_set_style_radius(close, 0, 0);
     lv_obj_add_event_cb(close, trace_popup_close_cb, LV_EVENT_CLICKED, nullptr);
 
     lv_obj_t *l = lv_label_create(close);
@@ -291,7 +292,7 @@ static lv_obj_t *add_menu_button(lv_obj_t *parent, const char *label, uint32_t c
     lv_obj_t *btn = lv_button_create(parent);
     lv_obj_set_size(btn, lv_pct(100), 46);
     lv_obj_set_style_bg_color(btn, lv_color_hex(color), 0);
-    lv_obj_set_style_radius(btn, 10, 0);
+    lv_obj_set_style_radius(btn, 0, 0);
     lv_obj_set_user_data(btn, (void *)(uintptr_t)action);
     lv_obj_add_event_cb(btn, node_menu_action_cb, LV_EVENT_CLICKED, ent);
 
@@ -322,7 +323,7 @@ static void node_card_long_pressed(lv_event_t *e)
     lv_obj_set_size(s_node_menu_overlay, SCR_W, SCR_H);
     lv_obj_set_pos(s_node_menu_overlay, 0, 0);
     lv_obj_set_style_bg_color(s_node_menu_overlay, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(s_node_menu_overlay, LV_OPA_60, 0);
+    lv_obj_set_style_bg_opa(s_node_menu_overlay, LV_OPA_TRANSP, 0);
     lv_obj_remove_flag(s_node_menu_overlay, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_move_foreground(s_node_menu_overlay);
 
@@ -332,7 +333,7 @@ static void node_card_long_pressed(lv_event_t *e)
     lv_obj_center(card);
     lv_obj_set_style_bg_color(card, lv_color_hex(TH_SURFACE), 0);
     lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(card, 14, 0);
+    lv_obj_set_style_radius(card, 0, 0);
     lv_obj_set_style_pad_all(card, 14, 0);
     lv_obj_set_style_pad_row(card, 8, 0);
     lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
@@ -372,10 +373,10 @@ static void add_node_card(NodeEntry *ent, const meshtastic_NodeInfoLite *n)
     lv_obj_t *card = lv_obj_create(s_nodes_list);
     lv_obj_remove_style_all(card);
     lv_obj_set_width(card, lv_pct(100));
-    lv_obj_set_height(card, 74);
+    lv_obj_set_height(card, 52);
     lv_obj_set_style_bg_color(card, lv_color_hex(TH_SURFACE), 0);
     lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(card, 10, 0);
+    lv_obj_set_style_radius(card, 0, 0);
     lv_obj_set_style_pad_all(card, 10, 0);
     lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
@@ -383,35 +384,13 @@ static void add_node_card(NodeEntry *ent, const meshtastic_NodeInfoLite *n)
     lv_obj_add_event_cb(card, node_card_clicked, LV_EVENT_CLICKED, nullptr);
     lv_obj_add_event_cb(card, node_card_long_pressed, LV_EVENT_LONG_PRESSED, nullptr);
 
-    // Avatar: 44x44 circle with short_name centered
-    lv_obj_t *dot = lv_obj_create(card);
-    lv_obj_remove_style_all(dot);
-    lv_obj_set_size(dot, 44, 44);
-    lv_obj_set_pos(dot, 0, 4);
-    lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_color(dot, lv_color_hex(TH_BUBBLE_OUT), 0);
-    lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
-    lv_obj_remove_flag(dot, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_remove_flag(dot, LV_OBJ_FLAG_CLICKABLE);
-
-    char short_name[6] = "?";
-    if (n->has_user && n->user.short_name[0]) {
-        strncpy(short_name, n->user.short_name, sizeof(short_name) - 1);
-        short_name[sizeof(short_name) - 1] = '\0';
-    }
-    lv_obj_t *dl = lv_label_create(dot);
-    lv_label_set_text(dl, short_name);
-    lv_obj_set_style_text_color(dl, lv_color_hex(TH_TEXT), 0);
-    lv_obj_set_style_text_font(dl, &lv_font_montserrat_16, 0);
-    lv_obj_center(dl);
-
     // Title: long name
     lv_obj_t *tl = lv_label_create(card);
     lv_label_set_text(tl, ent->title);
     lv_obj_set_style_text_color(tl, lv_color_hex(TH_TEXT), 0);
     lv_obj_set_style_text_font(tl, &lv_font_montserrat_16, 0);
-    lv_obj_set_pos(tl, 56, 2);
-    lv_obj_set_width(tl, SCR_W - 56 - 20);
+    lv_obj_set_pos(tl, 8, 2);
+    lv_obj_set_width(tl, SCR_W - 20);
     lv_label_set_long_mode(tl, LV_LABEL_LONG_DOT);
 
     // Second line: !id  ·  hw model
@@ -422,23 +401,11 @@ static void add_node_card(NodeEntry *ent, const meshtastic_NodeInfoLite *n)
     lv_label_set_text(l2, line2);
     lv_obj_set_style_text_color(l2, lv_color_hex(TH_TEXT2), 0);
     lv_obj_set_style_text_font(l2, &lv_font_montserrat_16, 0);
-    lv_obj_set_pos(l2, 56, 22);
-    lv_obj_set_width(l2, SCR_W - 56 - 20);
+    lv_obj_set_pos(l2, 8, 24);
+    lv_obj_set_width(l2, SCR_W - 20);
     lv_label_set_long_mode(l2, LV_LABEL_LONG_DOT);
-
-    // Third line: SNR / RSSI / last heard (smaller, dimmer)
-    char line3[80];
-    fmt_node_metrics(n, line3, sizeof(line3));
-    lv_obj_t *l3 = lv_label_create(card);
-    lv_label_set_text(l3, line3);
-    ent->line3 = l3;
-    strncpy(ent->line3_text, line3, sizeof(ent->line3_text) - 1);
-    ent->line3_text[sizeof(ent->line3_text) - 1] = '\0';
-    lv_obj_set_style_text_color(l3, lv_color_hex(TH_TEXT3), 0);
-    lv_obj_set_style_text_font(l3, &lv_font_montserrat_16, 0);
-    lv_obj_set_pos(l3, 56, 44);
-    lv_obj_set_width(l3, SCR_W - 56 - 20);
-    lv_label_set_long_mode(l3, LV_LABEL_LONG_DOT);
+    ent->line3 = nullptr;
+    ent->line3_text[0] = '\0';
 }
 
 static void update_node_metric_labels()
@@ -568,7 +535,9 @@ lv_obj_t *nodes_screen_create(lv_obj_t *parent)
     lv_obj_set_style_pad_row(s_nodes_list, 6, 0);
     lv_obj_set_flex_flow(s_nodes_list, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_scroll_dir(s_nodes_list, LV_DIR_VER);
-    lv_obj_set_scrollbar_mode(s_nodes_list, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_set_scrollbar_mode(s_nodes_list, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_clear_flag(s_nodes_list, LV_OBJ_FLAG_SCROLL_ELASTIC);
+    lv_obj_add_flag(s_nodes_list, LV_OBJ_FLAG_SCROLL_MOMENTUM);
 
     rebuild_nodes_list();
     s_last_action_tick = node_actions_change_tick();
@@ -586,10 +555,16 @@ void nodes_screen_tick()
     if (need_rebuild)
         s_last_action_tick = action_tick;
     if (need_rebuild) {
+        s_nodes_rebuild_pending = true;
+    }
+    if (s_nodes_rebuild_pending && !lv_obj_is_scrolling(s_nodes_list)) {
         rebuild_nodes_list();
+        s_nodes_rebuild_pending = false;
     } else if (now - s_last_dynamic_update_ms > NODE_DYNAMIC_REFRESH_MS) {
-        update_node_metric_labels();
-        s_last_dynamic_update_ms = now;
+        if (!lv_obj_is_scrolling(s_nodes_list)) {
+            update_node_metric_labels();
+            s_last_dynamic_update_ms = now;
+        }
     }
 }
 

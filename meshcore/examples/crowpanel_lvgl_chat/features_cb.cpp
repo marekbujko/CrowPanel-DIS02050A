@@ -15,6 +15,10 @@
 #include "utils.h"
 
 static lv_coord_t s_form_orig_h = 0;
+static bool s_webdash_inited = false;
+static bool s_ota_inited = false;
+static bool s_tg_inited = false;
+static bool s_translate_inited = false;
 
 // Forward: back button navigates to settings
 static void cb_features_back(lv_event_t*) {
@@ -25,6 +29,10 @@ static void cb_features_back(lv_event_t*) {
 // ── Telegram toggle ─────────────────────────────────────────
 
 static void cb_tg_toggle(lv_event_t*) {
+    if (!s_tg_inited) {
+        tgbridge_init();
+        s_tg_inited = true;
+    }
     // Read text areas in case user didn't defocus before toggling
     if (ui_tg_token_ta) {
         const char* txt = lv_textarea_get_text(ui_tg_token_ta);
@@ -68,6 +76,10 @@ static void cb_tg_token_focus(lv_event_t* e) {
 }
 
 static void cb_tg_token_defocus(lv_event_t* e) {
+    if (!s_tg_inited) {
+        tgbridge_init();
+        s_tg_inited = true;
+    }
     features_field_defocus(ui_tg_token_ta);
     const char* txt = lv_textarea_get_text(ui_tg_token_ta);
     tgbridge_set_token(txt ? txt : "");
@@ -78,6 +90,10 @@ static void cb_tg_chatid_focus(lv_event_t* e) {
 }
 
 static void cb_tg_chatid_defocus(lv_event_t* e) {
+    if (!s_tg_inited) {
+        tgbridge_init();
+        s_tg_inited = true;
+    }
     features_field_defocus(ui_tg_chatid_ta);
     const char* txt = lv_textarea_get_text(ui_tg_chatid_ta);
     tgbridge_set_chat_id(txt ? txt : "");
@@ -86,6 +102,10 @@ static void cb_tg_chatid_defocus(lv_event_t* e) {
 // ── Web dashboard toggle ────────────────────────────────────
 
 static void cb_wd_toggle(lv_event_t*) {
+    if (!s_webdash_inited) {
+        webdash_init();
+        s_webdash_inited = true;
+    }
     g_webdash_enabled = !g_webdash_enabled;
     if (g_webdash_enabled) webdash_start();
     else                   webdash_stop();
@@ -101,12 +121,20 @@ static void cb_ota_repo_focus(lv_event_t* e) {
 }
 
 static void cb_ota_repo_defocus(lv_event_t* e) {
+    if (!s_ota_inited) {
+        ota_init();
+        s_ota_inited = true;
+    }
     features_field_defocus(ui_ota_repo_ta);
     const char* txt = lv_textarea_get_text(ui_ota_repo_ta);
     ota_set_repo(txt ? txt : "");
 }
 
 static void cb_ota_check(lv_event_t*) {
+    if (!s_ota_inited) {
+        ota_init();
+        s_ota_inited = true;
+    }
     ota_check_for_update();
 }
 
@@ -125,16 +153,16 @@ static void cb_kb_ready(lv_event_t* e) {
 extern "C" void features_register_callbacks() {
     if (!ui_featuresscreen) return;
 
-    // Guard: only register once
-    static bool s_registered = false;
-    if (s_registered) {
+    // Guard per screen instance (screen can be destroyed/recreated).
+    static lv_obj_t* s_registered_screen = nullptr;
+    if (s_registered_screen == ui_featuresscreen) {
         // Just refresh values and labels on re-entry
-        tgbridge_populate_ui();
-        ota_populate_ui();
+        if (s_tg_inited) tgbridge_populate_ui();
+        if (s_ota_inited) ota_populate_ui();
         features_update_status_labels();
         return;
     }
-    s_registered = true;
+    s_registered_screen = ui_featuresscreen;
 
     // Back button is the first child of the header (second child of screen, first btn)
     lv_obj_t* hdr = lv_obj_get_child(ui_featuresscreen, 0);
@@ -181,6 +209,10 @@ extern "C" void features_register_callbacks() {
     // Translation callbacks
     reg(ui_autotranslate_toggle, cb_auto_translate_toggle);
     btn_lbl(ui_autotranslate_toggle, LV_SYMBOL_LOOP " Auto-Translate");
+    if (!s_translate_inited) {
+        translate_init();
+        s_translate_inited = true;
+    }
     if (ui_translate_lang_dd) {
         lv_dropdown_set_options(ui_translate_lang_dd, translate_lang_list());
         lv_dropdown_set_selected(ui_translate_lang_dd, g_translate_lang_idx);
@@ -194,8 +226,8 @@ extern "C" void features_register_callbacks() {
     if (ui_ota_check_lbl) lv_label_set_text(ui_ota_check_lbl, LV_SYMBOL_DOWNLOAD " Check for Update");
 
     // Load current values into text areas
-    tgbridge_populate_ui();
-    ota_populate_ui();
+    if (s_tg_inited) tgbridge_populate_ui();
+    if (s_ota_inited) ota_populate_ui();
 
     // Refresh status labels
     features_update_status_labels();

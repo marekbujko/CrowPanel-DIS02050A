@@ -1,5 +1,5 @@
 // ============================================================
-// wifi_ntp.cpp — WiFi connection, NTP time sync, credential storage
+// wifi_ntp.cpp - WiFi connection, NTP time sync, credential storage
 // ============================================================
 
 #include "wifi_ntp.h"
@@ -10,6 +10,7 @@
 #include <WiFi.h>
 #include <Preferences.h>
 #include <time.h>
+#include <esp_heap_caps.h>
 #include <target.h>
 #include <RTClib.h>
 
@@ -26,6 +27,9 @@ static uint32_t s_reconnect_ms = 0;
 static bool s_ntp_synced_once = false;
 static const uint32_t NTP_SYNC_INTERVAL_MS = 3600000UL;  // re-sync every hour
 static const uint32_t RECONNECT_INTERVAL_MS = 30000UL;
+static bool s_wifi_driver_ok = true;
+static const size_t WIFI_INIT_MIN_FREE_INTERNAL = 52000;
+static const size_t WIFI_INIT_MIN_LARGEST_INTERNAL = 22000;
 
 // Deferred scan state
 static volatile bool s_scan_requested = false;
@@ -90,11 +94,36 @@ static void wifi_save_enabled(bool en) {
   s_wifi_prefs.end();
 }
 
+static bool wifi_ensure_sta() {
+  wifi_mode_t mode = WiFi.getMode();
+  if (mode == WIFI_STA || mode == WIFI_AP_STA) return true;
+  if (!WiFi.mode(WIFI_STA)) {
+    serialmon_append("WiFi: STA mode init failed (esp_wifi_init no mem)");
+    s_wifi_driver_ok = false;
+    return false;
+  }
+  return true;
+}
+
+static bool wifi_memory_ok_for_driver() {
+  size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+  size_t largest_internal = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+  if (free_internal < WIFI_INIT_MIN_FREE_INTERNAL || largest_internal < WIFI_INIT_MIN_LARGEST_INTERNAL) {
+    char msg[112];
+    snprintf(msg, sizeof(msg),
+             "WiFi: init skipped (low mem free=%u largest=%u)",
+             (unsigned)free_internal, (unsigned)largest_internal);
+    serialmon_append(msg);
+    return false;
+  }
+  return true;
+}
+
 // ---- RTC hardware time persistence ----
 
 static void wifi_write_time_to_rtc(uint32_t utc_epoch) {
   if (!g_rtc_ok) return;
-  g_rtc.adjust(DateTime(utc_epoch));  // store UTC directly — no offset
+  g_rtc.adjust(DateTime(utc_epoch));  // store UTC directly - no offset
 }
 
 // ---- NTP sync ----
@@ -130,9 +159,20 @@ void wifi_ntp_sync() {
 
 void wifi_init() {
   wifi_load_credentials();
+  s_wifi_driver_ok = true;
 
   if (g_wifi_enabled) {
-    WiFi.mode(WIFI_STA);
+    if (!wifi_memory_ok_for_driver()) {
+      g_wifi_enabled = false;
+      wifi_save_enabled(false);
+      s_wifi_driver_ok = false;
+      return;
+    }
+    if (!wifi_ensure_sta()) {
+      g_wifi_enabled = false;
+      wifi_save_enabled(false);
+      return;
+    }
     WiFi.setAutoReconnect(false);
     if (wifi_has_credentials()) {
       wifi_connect_saved();
@@ -141,11 +181,11 @@ void wifi_init() {
 }
 
 void wifi_connect_saved() {
-  if (!wifi_has_credentials()) return;
+  if (!wifi_has_credentials() || !s_wifi_driver_ok) return;
+  if (!wifi_ensure_sta()) return;
 
-  WiFi.disconnect(true);
+  WiFi.disconnect(false, false);
   delay(100);
-  WiFi.mode(WIFI_STA);
   WiFi.begin(g_wifi_ssid, s_wifi_pass);
 
   char msg[64];
@@ -165,7 +205,22 @@ void wifi_toggle(bool enable) {
   wifi_save_enabled(enable);
 
   if (enable) {
-    WiFi.mode(WIFI_STA);
+    s_wifi_driver_ok = true;
+    if (!wifi_memory_ok_for_driver()) {
+      g_wifi_enabled = false;
+      wifi_save_enabled(false);
+      s_wifi_driver_ok = false;
+      s_reconnect_ms = 0;
+      g_deferred_wifi_status_dirty = true;
+      return;
+    }
+    if (!wifi_ensure_sta()) {
+      g_wifi_enabled = false;
+      wifi_save_enabled(false);
+      s_reconnect_ms = 0;
+      g_deferred_wifi_status_dirty = true;
+      return;
+    }
     WiFi.setAutoReconnect(false);
     if (wifi_has_credentials()) wifi_connect_saved();
   } else {
@@ -213,9 +268,23 @@ static void wifi_do_sync_scan() {
     delay(200);
   }
 
+  // Guard against known ESP32-S3 crash path:
+  // WiFi scan may abort when internal heap is too fragmented/low.
+  size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+  size_t largest_internal = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+  if (free_internal < 50000 || largest_internal < 24000) {
+    char msg[96];
+    snprintf(msg, sizeof(msg), "WiFi: scan skipped (low mem free=%u largest=%u)",
+             (unsigned)free_internal, (unsigned)largest_internal);
+    serialmon_append(msg);
+    s_scan_result_count = 0;
+    s_scan_results_ready = true;
+    return;
+  }
+
   WiFi.scanDelete();
 
-  // Synchronous scan — blocks ~2-4 seconds but reliably returns results
+  // Synchronous scan - blocks ~2-4 seconds but reliably returns results
   int n = WiFi.scanNetworks(false, false, false, 300);
 
   if (n > 0) {
@@ -233,13 +302,13 @@ static void wifi_do_sync_scan() {
 // ---- Loop ----
 
 void wifi_loop() {
-  // Handle deferred scan (runs even if WiFi is "disabled" — scan temporarily enables STA)
+  // Handle deferred scan (runs even if WiFi is "disabled" - scan temporarily enables STA)
   if (s_scan_requested) {
     s_scan_requested = false;
     wifi_do_sync_scan();
   }
 
-  if (!g_wifi_enabled) return;
+  if (!g_wifi_enabled || !s_wifi_driver_ok) return;
 
   bool was_connected = g_wifi_connected;
   g_wifi_connected = (WiFi.status() == WL_CONNECTED);
@@ -262,6 +331,21 @@ void wifi_loop() {
   // Reconnect if we have credentials but aren't connected
   if (!g_wifi_connected && wifi_has_credentials() && s_reconnect_ms > 0) {
     if ((int32_t)(millis() - s_reconnect_ms) > 0) {
+      if (!wifi_memory_ok_for_driver()) {
+        g_wifi_enabled = false;
+        wifi_save_enabled(false);
+        s_wifi_driver_ok = false;
+        s_reconnect_ms = 0;
+        g_deferred_wifi_status_dirty = true;
+        return;
+      }
+      if (!wifi_ensure_sta()) {
+        g_wifi_enabled = false;
+        wifi_save_enabled(false);
+        s_reconnect_ms = 0;
+        g_deferred_wifi_status_dirty = true;
+        return;
+      }
       wifi_connect_saved();
     }
   }

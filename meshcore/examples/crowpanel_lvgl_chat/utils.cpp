@@ -14,11 +14,13 @@
 // ---- I2C helpers ----
 bool i2c_ok(uint8_t a)  { Wire.beginTransmission(a); return !Wire.endTransmission(); }
 void i2c_cmd(uint8_t c) { Wire.beginTransmission(0x30); Wire.write(c); Wire.endTransmission(); }
+static constexpr uint8_t BL_ALT_OFF = 245;
 
 // ---- Screen sleep/wake ----
 void screen_sleep() {
   if (!g_screen_awake) return;
   i2c_cmd(BL_OFF);
+  i2c_cmd(BL_ALT_OFF);
   g_screen_awake = false;
   g_ramp_current = 0;
 }

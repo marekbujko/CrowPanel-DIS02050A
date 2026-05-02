@@ -81,6 +81,7 @@ void cb_hashtag_ready(lv_event_t*);
 
 // Purge data
 void cb_purge_data(lv_event_t*);
+void cb_reboot_device(lv_event_t*);
 void purge_btn_restore_position();
 
 // WiFi

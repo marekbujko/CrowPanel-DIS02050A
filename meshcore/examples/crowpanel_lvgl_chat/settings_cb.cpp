@@ -693,6 +693,11 @@ void cb_purge_data(lv_event_t*) {
                 "Press Purge Data again to delete all contacts and repeaters");
 }
 
+void cb_reboot_device(lv_event_t*) {
+  delay(80);
+  esp_restart();
+}
+
 // ---- Presets ----
 void ui_populate_presets() {
   if (!ui_presetsdropdown || !g_mesh) return;
@@ -717,6 +722,7 @@ void ui_populate_presets() {
 // ============================================================
 
 static lv_timer_t* s_wifi_scan_timer = nullptr;
+static uint32_t s_wifi_scan_started_ms = 0;
 
 void ui_apply_wifi_state() {
   if (!ui_wifitoggle) return;
@@ -787,12 +793,22 @@ void cb_wifi_scan(lv_event_t*) {
     return;
   }
   wifi_request_scan();
+  s_wifi_scan_started_ms = millis();
   if (ui_wifiscan_lbl) lv_label_set_text(ui_wifiscan_lbl, LV_SYMBOL_REFRESH " Scanning...");
   if (ui_wifiscanbutton) lv_obj_add_state(ui_wifiscanbutton, LV_STATE_DISABLED);
 
   // Poll for results from the deferred synchronous scan
   if (s_wifi_scan_timer) lv_timer_del(s_wifi_scan_timer);
   s_wifi_scan_timer = lv_timer_create([](lv_timer_t* t) {
+    if ((uint32_t)(millis() - s_wifi_scan_started_ms) > 15000UL) {
+      serialmon_append("WiFi: scan timeout, please try again");
+      wifi_scan_results_consumed();
+      if (ui_wifiscan_lbl) lv_label_set_text(ui_wifiscan_lbl, LV_SYMBOL_REFRESH " Scan");
+      if (ui_wifiscanbutton) lv_obj_clear_state(ui_wifiscanbutton, LV_STATE_DISABLED);
+      lv_timer_del(t);
+      s_wifi_scan_timer = nullptr;
+      return;
+    }
     if (!wifi_scan_results_ready()) return;
 
     int n = wifi_scan_result_count();
@@ -809,13 +825,21 @@ void cb_wifi_scan(lv_event_t*) {
         strncat(scan_opts, line, sizeof(scan_opts) - strlen(scan_opts) - 1);
       }
       if (ui_wifinetworksdropdown) {
-        lv_dropdown_set_options(ui_wifinetworksdropdown, scan_opts);
+        if (scan_opts[0] == '\0') {
+          lv_dropdown_set_options(ui_wifinetworksdropdown, "(no visible SSIDs)");
+        } else {
+          lv_dropdown_set_options(ui_wifinetworksdropdown, scan_opts);
+        }
         lv_dropdown_set_selected(ui_wifinetworksdropdown, 0);
       }
       wifi_show_network_ui(true);
     } else {
       serialmon_append("WiFi: no networks found - try again");
-      wifi_show_network_ui(false);
+      if (ui_wifinetworksdropdown) {
+        lv_dropdown_set_options(ui_wifinetworksdropdown, "(no networks found)");
+        lv_dropdown_set_selected(ui_wifinetworksdropdown, 0);
+      }
+      wifi_show_network_ui(true);
     }
 
     wifi_scan_results_consumed();

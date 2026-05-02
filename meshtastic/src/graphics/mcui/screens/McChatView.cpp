@@ -43,6 +43,7 @@ static lv_obj_t *s_textarea = nullptr;
 static lv_obj_t *s_send_btn = nullptr;
 static McConvId s_current = McConvId::none();
 static uint32_t s_last_tick = 0;
+static bool s_rebuild_pending = false;
 
 // Edge-swipe back gesture state. Records where the most recent press began
 // so the GESTURE handler can tell whether a left swipe originated from the
@@ -251,7 +252,7 @@ static void add_bubble(const McMessage &m)
     lv_obj_add_flag(bubble, LV_OBJ_FLAG_EVENT_BUBBLE);
     lv_obj_set_width(bubble, lv_pct(82));
     lv_obj_set_height(bubble, LV_SIZE_CONTENT);
-    lv_obj_set_style_radius(bubble, 14, 0);
+    lv_obj_set_style_radius(bubble, 0, 0);
     lv_obj_set_style_pad_all(bubble, 10, 0);
     lv_obj_set_style_pad_row(bubble, 2, 0);
     lv_obj_set_style_bg_opa(bubble, LV_OPA_COVER, 0);
@@ -270,12 +271,18 @@ static void add_bubble(const McMessage &m)
     // Header line for incoming bubbles: sender short name + time
     char head[64] = {0};
     if (!m.outgoing) {
-        const char *sender = "?";
+        char sender_buf[16] = "?";
+        const char *sender = sender_buf;
         if (nodeDB) {
             auto *n = nodeDB->getMeshNode(m.from_node);
             if (n && n->has_user) {
-                sender = n->user.short_name[0] ? n->user.short_name : n->user.long_name;
+                if (n->user.short_name[0] || n->user.long_name[0]) {
+                    sender = n->user.short_name[0] ? n->user.short_name : n->user.long_name;
+                }
             }
+        }
+        if (sender == sender_buf && m.from_node != 0) {
+            snprintf(sender_buf, sizeof(sender_buf), "!%08x", (unsigned)m.from_node);
         }
         char ts[8] = "--:--";
         if (m.timestamp > 1700000000) {
@@ -299,25 +306,14 @@ static void add_bubble(const McMessage &m)
     char foot[48] = {0};
     uint32_t foot_color = TH_TEXT3;
     if (m.outgoing) {
-        // Three-state for DMs with want_ack:
-        //  - !delivered           -> "sent" (in flight, awaiting ACK/NAK/retry)
-        //  - delivered, no fail   -> "✓ acknowledged" (real ACK landed)
-        //  - delivered, failed    -> "✗ failed" (NAK or retries exhausted)
-        // Channel broadcasts have no ACK so they land in the "acknowledged"
-        // branch immediately (delivered=true, ack_failed=false) — we relabel
-        // that to plain "sent" to avoid misleading the user into thinking
-        // the broadcast was confirmed.
         if (!m.delivered) {
             snprintf(foot, sizeof(foot), "sent");
         } else if (m.ack_failed) {
             snprintf(foot, sizeof(foot), LV_SYMBOL_CLOSE " failed");
             foot_color = 0xE06060; // muted red
         } else if (m.packet_id == 0) {
-            // Channel broadcast shortcut: delivered immediately on send,
-            // no packet id tracked.
             snprintf(foot, sizeof(foot), "sent");
         } else {
-            // Double-tick (WhatsApp-style) to distinguish delivered from sent.
             snprintf(foot, sizeof(foot), LV_SYMBOL_OK LV_SYMBOL_OK " acknowledged");
         }
     } else if (m.snr != 0 || m.rssi != 0) {
@@ -327,9 +323,6 @@ static void add_bubble(const McMessage &m)
         lv_obj_t *f = lv_label_create(bubble);
         lv_label_set_text(f, foot);
         lv_obj_set_style_text_color(f, lv_color_hex(foot_color), 0);
-        // Use montserrat_16 explicitly so LV_SYMBOL_OK / LV_SYMBOL_CLOSE
-        // (and other symbol glyphs) actually render — the default font
-        // doesn't include the symbol range.
         lv_obj_set_style_text_font(f, &lv_font_montserrat_16, 0);
     }
 }
@@ -413,7 +406,9 @@ lv_obj_t *chatview_create(lv_obj_t *parent)
     lv_obj_set_style_pad_row(s_bubbles, 6, 0);
     lv_obj_set_flex_flow(s_bubbles, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_scroll_dir(s_bubbles, LV_DIR_VER);
-    lv_obj_set_scrollbar_mode(s_bubbles, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_set_scrollbar_mode(s_bubbles, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_clear_flag(s_bubbles, LV_OBJ_FLAG_SCROLL_ELASTIC);
+    lv_obj_add_flag(s_bubbles, LV_OBJ_FLAG_SCROLL_MOMENTUM);
     // Dismiss-keyboard / swipe-back press handler on the bubble area.
     // Dynamically created bubble rows get LV_OBJ_FLAG_EVENT_BUBBLE in
     // add_bubble() so taps on individual rows bubble up to us here.
@@ -448,7 +443,7 @@ lv_obj_t *chatview_create(lv_obj_t *parent)
     lv_obj_set_style_bg_color(s_textarea, lv_color_hex(TH_INPUT), 0);
     lv_obj_set_style_text_color(s_textarea, lv_color_hex(TH_TEXT), 0);
     lv_obj_set_style_border_width(s_textarea, 0, 0);
-    lv_obj_set_style_radius(s_textarea, 8, 0);
+    lv_obj_set_style_radius(s_textarea, 0, 0);
     // Disable the blinking cursor animation — it invalidates the textarea
     // bounding box every blink, forcing an SPI-bound partial flush every
     // ~400 ms. On this panel the flush is expensive enough that the cursor
@@ -467,7 +462,7 @@ lv_obj_t *chatview_create(lv_obj_t *parent)
     lv_obj_set_size(s_send_btn, SEND_BTN_W, INPUT_ROW_H - 12);
     lv_obj_set_pos(s_send_btn, SCR_W - SEND_BTN_W - SEND_BTN_MARGIN, 6);
     lv_obj_set_style_bg_color(s_send_btn, lv_color_hex(TH_ACCENT), 0);
-    lv_obj_set_style_radius(s_send_btn, 8, 0);
+    lv_obj_set_style_radius(s_send_btn, 0, 0);
     // Use RELEASED (not CLICKED) so a touch is committed as soon as the
     // finger lifts, even if the press period was very short or had slight
     // jitter. LV_EVENT_CLICKED can be missed on a slow-refreshing display
@@ -542,8 +537,16 @@ void chatview_tick()
     uint32_t t = messages_change_tick();
     if (t != s_last_tick) {
         s_last_tick = t;
-        rebuild_bubbles();
-        if (s_current.is_valid()) messages_mark_read(s_current);
+        s_rebuild_pending = true;
+    }
+    if (s_rebuild_pending) {
+        // Avoid expensive list teardown/rebuild while finger is actively
+        // scrolling; apply once scrolling settles.
+        if (!lv_obj_is_scrolling(s_bubbles)) {
+            rebuild_bubbles();
+            if (s_current.is_valid()) messages_mark_read(s_current);
+            s_rebuild_pending = false;
+        }
     }
 }
 

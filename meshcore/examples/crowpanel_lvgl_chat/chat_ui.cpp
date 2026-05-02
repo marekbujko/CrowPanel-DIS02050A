@@ -18,7 +18,6 @@ static lv_obj_t* g_path_discover_btn = nullptr;
 extern bool g_wifi_connected;
 
 static void cb_bubble_long_press_translate(lv_event_t* e) {
-    if (g_auto_translate_enabled) return;  // auto-translate handles it
     if (!g_wifi_connected) return;
     // user_data is the bubble container, target is the label that was touched
     lv_obj_t* bubble = (lv_obj_t*)lv_event_get_user_data(e);

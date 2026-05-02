@@ -22,6 +22,12 @@ lv_obj_t * ui_repeaterpassword     = NULL;
 lv_obj_t * ui_Label17              = NULL;
 lv_obj_t * ui_statusbutton         = NULL;
 lv_obj_t * ui_Label19              = NULL;
+lv_obj_t * ui_pathresetbutton      = NULL;
+lv_obj_t * ui_repeater_label_pathreset = NULL;
+lv_obj_t * ui_repeaterclibutton    = NULL;
+lv_obj_t * ui_repeater_label_cli   = NULL;
+lv_obj_t * ui_repeaterexitclibutton = NULL;
+lv_obj_t * ui_repeater_label_exitcli = NULL;
 lv_obj_t * ui_Keyboard3            = NULL;
 lv_obj_t * ui_Label4               = NULL;
 lv_obj_t * ui_repeatersearchfield  = NULL;
@@ -244,19 +250,27 @@ void ui_repeaterscreen_screen_init(void) {
       lv_coord_t bcw = (SCR_H < SCR_W) ? lv_pct(96) : (BTN_COL_W - 4);
       int16_t    bch = (SCR_H < SCR_W) ? 48 : 56;
       ui_statusbutton         = make_btn_v(btn_col, &ui_Label19, bcw, bch, TH_ACCENT);
+      ui_pathresetbutton      = make_btn_v(btn_col, &ui_repeater_label_pathreset, bcw, bch, TH_ACCENT);
       ui_repeateradvertbutton = make_btn_v(btn_col, &ui_Label14, bcw, bch, TH_ACCENT);
       ui_neighboursbutton     = make_btn_v(btn_col, &ui_Label13, bcw, bch, TH_ACCENT);
+      ui_repeaterclibutton    = make_btn_v(btn_col, &ui_repeater_label_cli, bcw, bch, TH_ACCENT);
+      ui_repeaterexitclibutton = make_btn_v(btn_col, &ui_repeater_label_exitcli, bcw, bch, TH_RED);
       ui_rebootbutton         = make_btn_v(btn_col, &ui_Label26, bcw, bch, TH_RED);
     }
 
     lv_label_set_text(ui_Label19, LV_SYMBOL_REFRESH "\nStatus");
+    lv_label_set_text(ui_repeater_label_pathreset, LV_SYMBOL_GPS "\nPath Reset");
     lv_label_set_text(ui_Label14, LV_SYMBOL_UPLOAD  "\nAdvert");
     lv_label_set_text(ui_Label13, LV_SYMBOL_LIST    "\nNeighbours");
+    lv_label_set_text(ui_repeater_label_cli, LV_SYMBOL_EDIT "\nCLI");
+    lv_label_set_text(ui_repeater_label_exitcli, LV_SYMBOL_CLOSE "\nExit CLI");
     lv_label_set_text(ui_Label26, LV_SYMBOL_POWER   "\nReboot");
 
     lv_obj_add_flag(ui_statusbutton,         LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(ui_repeateradvertbutton, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(ui_neighboursbutton,     LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(ui_repeaterclibutton,    LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(ui_repeaterexitclibutton,LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(ui_rebootbutton,         LV_OBJ_FLAG_HIDDEN);
 
     // Unused stubs

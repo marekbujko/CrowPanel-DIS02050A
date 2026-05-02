@@ -456,6 +456,11 @@ protected:
 
   void sendFloodScoped(const ContactInfo& recipient, mesh::Packet* pkt, uint32_t delay_millis = 0) override {
     uint8_t phs = _prefs.path_hash_mode + 1;
+    // Repeater control/login traffic is more reliable when not constrained by transport scope.
+    if (recipient.type == ADV_TYPE_REPEATER) {
+      sendFlood(pkt, delay_millis, phs);
+      return;
+    }
     if (_send_scope.isNull()) {
       sendFlood(pkt, delay_millis, phs);
     } else {
@@ -2171,6 +2176,7 @@ void setup() {
   reg(ui_positionadverttoggle, cb_position_advert_toggle, LV_EVENT_VALUE_CHANGED);
 
   reg(ui_purgedatabutton, cb_purge_data);
+  reg(ui_rebootappbutton, cb_reboot_device);
 
   reg(ui_notificationstoggle, cb_notifications_toggle);
   ui_apply_notifications_state();
@@ -2184,10 +2190,8 @@ void setup() {
   wifi_init();
 
   // Features & Bridges
-  ota_init();
-  webdash_init();
-  tgbridge_init();
-  translate_init();
+  // Lazy-init heavy network modules from Web Apps screen to preserve
+  // internal heap for WiFi driver startup on constrained ESP32-S3 units.
 
 
 #if ENABLE_ADVERT_ON_BOOT == 1
@@ -2438,9 +2442,15 @@ void loop() {
 
   rtc_clock.tick();
   wifi_loop();
-  ota_loop();
-  webdash_loop();
-  tgbridge_loop();
+  {
+    static uint32_t s_ota_last_ms = 0;
+    static uint32_t s_web_last_ms = 0;
+    static uint32_t s_tg_last_ms = 0;
+    uint32_t now = millis();
+    if ((uint32_t)(now - s_ota_last_ms) >= 300) { s_ota_last_ms = now; ota_loop(); }
+    if ((uint32_t)(now - s_web_last_ms) >= 300) { s_web_last_ms = now; webdash_loop(); }
+    if ((uint32_t)(now - s_tg_last_ms) >= 300) { s_tg_last_ms = now; tgbridge_loop(); }
+  }
   translate_loop();
   poll_channel_receipt_if_due();
 
@@ -2483,15 +2493,27 @@ void loop() {
 
   if (g_login_timeout_ms && (int32_t)(millis() - g_login_timeout_ms) > 0) {
     g_login_timeout_ms = 0;
-    if (!g_repeater_logged_in && g_selected_repeater && g_mesh && g_login_retry_count < 2) {
+    bool key_matches_selection = (g_selected_repeater &&
+      memcmp(g_login_pending_key, g_selected_repeater->id.pub_key, 4) == 0);
+    if (!key_matches_selection) {
+      memset(g_login_pending_key, 0, 4);
+      g_login_retry_count = 0;
+    } else if (!g_repeater_logged_in && g_selected_repeater && g_mesh && g_login_retry_count < 4) {
       g_login_retry_count++;
-      uint32_t est_timeout;
+      uint32_t est_timeout = 0;
       int result = g_mesh->sendLogin(*g_selected_repeater, g_login_last_pw, est_timeout);
+      if (result != MSG_SEND_FAILED && g_selected_repeater->out_path_len != 0) {
+        ContactInfo flood_target = *g_selected_repeater;
+        flood_target.out_path_len = OUT_PATH_UNKNOWN;
+        uint32_t assist_timeout = 0;
+        (void)g_mesh->sendLogin(flood_target, g_login_last_pw, assist_timeout);
+        if (assist_timeout > est_timeout) est_timeout = assist_timeout;
+      }
       if (result != MSG_SEND_FAILED) {
         memcpy(g_login_pending_key, g_selected_repeater->id.pub_key, 4);
         g_login_timeout_ms = millis() + max(est_timeout * 4, (uint32_t)20000);
         char msg[48];
-        snprintf(msg, sizeof(msg), "Retry %d/2 - waiting for response...", g_login_retry_count);
+        snprintf(msg, sizeof(msg), "Retry %d/4 - waiting for response...", g_login_retry_count);
         repeater_update_monitor(msg);
         return;
       }
@@ -2586,8 +2608,20 @@ int mesh_repeater_login(const uint8_t* pub_key, const char* password) {
   if (!g_uimesh) return -1;
   ContactInfo* c = g_uimesh->lookupContactByPubKey(pub_key, 32);
   if (!c) return -1;
-  uint32_t est_timeout;
+  // Prime routing table before login attempt.
+  g_uimesh->sendDiscoverRepeaters();
+  uint32_t tag = 0, pre_timeout = 0;
+  ContactInfo flood_target = *c;
+  flood_target.out_path_len = OUT_PATH_UNKNOWN;
+  g_uimesh->sendRequest(flood_target, (uint8_t)0x01, tag, pre_timeout);
+
+  uint32_t est_timeout = 0;
   int result = g_uimesh->sendLogin(*c, password, est_timeout);
+  if (result != MSG_SEND_FAILED && c->out_path_len != 0) {
+    uint32_t assist_timeout = 0;
+    (void)g_uimesh->sendLogin(flood_target, password, assist_timeout);
+    if (assist_timeout > est_timeout) est_timeout = assist_timeout;
+  }
   if (result == MSG_SEND_FAILED) return -1;
   g_selected_repeater = c;
   memcpy(g_login_pending_key, pub_key, 4);

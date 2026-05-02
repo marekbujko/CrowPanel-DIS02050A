@@ -63,7 +63,8 @@ static uint32_t avatar_color_for(const McConvId &id, const char *title)
 // `psk_len == 0` (with psk == nullptr) creates a new channel with a fresh
 // random 16-byte key. A non-null psk of length 1/16/32 joins an existing
 // channel by writing that PSK into a free secondary slot.
-static bool channel_create(const char *name, const uint8_t *psk = nullptr, size_t psk_len = 0)
+static bool channel_create(const char *name, const uint8_t *psk = nullptr, size_t psk_len = 0,
+                           bool mqtt_uplink = true, bool mqtt_downlink = true)
 {
     if (!name || !*name) return false;
     if (psk_len != 0 && psk_len != 1 && psk_len != 16 && psk_len != 32) {
@@ -91,6 +92,8 @@ static bool channel_create(const char *name, const uint8_t *psk = nullptr, size_
     memset(&ch.settings, 0, sizeof(ch.settings));
     strncpy(ch.settings.name, name, sizeof(ch.settings.name) - 1);
     ch.settings.name[sizeof(ch.settings.name) - 1] = '\0';
+    ch.settings.uplink_enabled = mqtt_uplink;
+    ch.settings.downlink_enabled = mqtt_downlink;
 
     if (psk && psk_len > 0) {
         memcpy(ch.settings.psk.bytes, psk, psk_len);
@@ -141,6 +144,7 @@ static lv_obj_t *s_chats_page = nullptr;  // the "page" container we own
 static lv_obj_t *s_chats_list = nullptr;  // scrollable list container
 static lv_obj_t *s_chat_delete_overlay = nullptr;
 static uint32_t s_chats_last_tick = 0xFFFFFFFFu;
+static bool s_chats_rebuild_pending = false;
 static McConvId s_pending_delete_id = McConvId::none();
 static McConvId s_suppress_click_id = McConvId::none();
 static uint32_t s_suppress_click_ms = 0;
@@ -250,7 +254,7 @@ static void chat_card_long_pressed(lv_event_t *e)
     lv_obj_set_size(s_chat_delete_overlay, SCR_W, SCR_H);
     lv_obj_set_pos(s_chat_delete_overlay, 0, 0);
     lv_obj_set_style_bg_color(s_chat_delete_overlay, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(s_chat_delete_overlay, LV_OPA_60, 0);
+    lv_obj_set_style_bg_opa(s_chat_delete_overlay, LV_OPA_TRANSP, 0);
     lv_obj_remove_flag(s_chat_delete_overlay, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_move_foreground(s_chat_delete_overlay);
 
@@ -260,7 +264,7 @@ static void chat_card_long_pressed(lv_event_t *e)
     lv_obj_center(card);
     lv_obj_set_style_bg_color(card, lv_color_hex(TH_SURFACE), 0);
     lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(card, 14, 0);
+    lv_obj_set_style_radius(card, 0, 0);
     lv_obj_set_style_pad_all(card, 16, 0);
     lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
 
@@ -284,7 +288,7 @@ static void chat_card_long_pressed(lv_event_t *e)
     lv_obj_set_size(cancel, 150, 42);
     lv_obj_align(cancel, LV_ALIGN_BOTTOM_LEFT, 0, 0);
     lv_obj_set_style_bg_color(cancel, lv_color_hex(TH_INPUT), 0);
-    lv_obj_set_style_radius(cancel, 8, 0);
+    lv_obj_set_style_radius(cancel, 0, 0);
     lv_obj_t *cl = lv_label_create(cancel);
     lv_label_set_text(cl, "Cancel");
     lv_obj_set_style_text_color(cl, lv_color_hex(TH_TEXT), 0);
@@ -295,7 +299,7 @@ static void chat_card_long_pressed(lv_event_t *e)
     lv_obj_set_size(delete_btn, 150, 42);
     lv_obj_align(delete_btn, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
     lv_obj_set_style_bg_color(delete_btn, lv_color_hex(0xB83232), 0);
-    lv_obj_set_style_radius(delete_btn, 8, 0);
+    lv_obj_set_style_radius(delete_btn, 0, 0);
     lv_obj_t *dl = lv_label_create(delete_btn);
     lv_label_set_text(dl, delete_label);
     lv_obj_set_style_text_color(dl, lv_color_hex(0xFFFFFF), 0);
@@ -315,6 +319,8 @@ static lv_obj_t *s_chcreate_overlay = nullptr;
 static lv_obj_t *s_chcreate_name    = nullptr;
 static lv_obj_t *s_chcreate_psk     = nullptr;
 static lv_obj_t *s_chcreate_status  = nullptr;
+static lv_obj_t *s_chcreate_uplink  = nullptr;
+static lv_obj_t *s_chcreate_downlink = nullptr;
 
 static void chcreate_close()
 {
@@ -326,6 +332,8 @@ static void chcreate_close()
     s_chcreate_name   = nullptr;
     s_chcreate_psk    = nullptr;
     s_chcreate_status = nullptr;
+    s_chcreate_uplink = nullptr;
+    s_chcreate_downlink = nullptr;
 }
 
 static void chcreate_cancel_cb(lv_event_t *) { chcreate_close(); }
@@ -401,7 +409,10 @@ static void chcreate_ok_cb(lv_event_t *)
         }
     }
 
-    if (!channel_create(name, psk_ptr, psk_len)) {
+    bool mqtt_uplink = s_chcreate_uplink && lv_obj_has_state(s_chcreate_uplink, LV_STATE_CHECKED);
+    bool mqtt_downlink = s_chcreate_downlink && lv_obj_has_state(s_chcreate_downlink, LV_STATE_CHECKED);
+
+    if (!channel_create(name, psk_ptr, psk_len, mqtt_uplink, mqtt_downlink)) {
         chcreate_status("No free channel slot (delete one first)", false);
         return;
     }
@@ -426,21 +437,29 @@ static void chcreate_open()
     lv_obj_set_size(s_chcreate_overlay, SCR_W, SCR_H);
     lv_obj_set_pos(s_chcreate_overlay, 0, 0);
     lv_obj_set_style_bg_color(s_chcreate_overlay, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(s_chcreate_overlay, LV_OPA_60, 0);
+    lv_obj_set_style_bg_opa(s_chcreate_overlay, LV_OPA_TRANSP, 0);
     lv_obj_remove_flag(s_chcreate_overlay, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_move_foreground(s_chcreate_overlay);
 
-    const int card_h = 340;
+    const int card_h = landscape_active() ? (SCR_H - keyboard_height() - 16) : 430;
     lv_obj_t *card = lv_obj_create(s_chcreate_overlay);
     lv_obj_remove_style_all(card);
     lv_obj_set_size(card, SCR_W - 40, card_h);
     // Sit just above the keyboard so both are visible.
-    lv_obj_set_pos(card, 20, SCR_H - keyboard_height() - card_h - 20);
+    int card_y = SCR_H - keyboard_height() - card_h - 8;
+    if (card_y < 8) card_y = 8;
+    lv_obj_set_pos(card, 20, card_y);
     lv_obj_set_style_bg_color(card, lv_color_hex(TH_SURFACE), 0);
     lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(card, 12, 0);
+    lv_obj_set_style_radius(card, 0, 0);
     lv_obj_set_style_pad_all(card, 16, 0);
-    lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    // Landscape has limited vertical space with keyboard shown; keep the
+    // modal scrollable so all fields/toggles remain reachable.
+    lv_obj_add_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(card, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(card, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLL_ELASTIC);
+    lv_obj_add_flag(card, LV_OBJ_FLAG_SCROLL_MOMENTUM);
 
     int y = 0;
 
@@ -460,7 +479,7 @@ static void chcreate_open()
     lv_obj_set_style_bg_color(s_chcreate_name, lv_color_hex(TH_INPUT), 0);
     lv_obj_set_style_text_color(s_chcreate_name, lv_color_hex(TH_TEXT), 0);
     lv_obj_set_style_border_width(s_chcreate_name, 0, 0);
-    lv_obj_set_style_radius(s_chcreate_name, 8, 0);
+    lv_obj_set_style_radius(s_chcreate_name, 0, 0);
     lv_obj_set_style_anim_duration(s_chcreate_name, 0, LV_PART_CURSOR);
     lv_obj_add_event_cb(s_chcreate_name, chcreate_focus_cb, LV_EVENT_FOCUSED, nullptr);
     y += 50;
@@ -485,10 +504,42 @@ static void chcreate_open()
     lv_obj_set_style_bg_color(s_chcreate_psk, lv_color_hex(TH_INPUT), 0);
     lv_obj_set_style_text_color(s_chcreate_psk, lv_color_hex(TH_TEXT), 0);
     lv_obj_set_style_border_width(s_chcreate_psk, 0, 0);
-    lv_obj_set_style_radius(s_chcreate_psk, 8, 0);
+    lv_obj_set_style_radius(s_chcreate_psk, 0, 0);
     lv_obj_set_style_anim_duration(s_chcreate_psk, 0, LV_PART_CURSOR);
     lv_obj_add_event_cb(s_chcreate_psk, chcreate_focus_cb, LV_EVENT_FOCUSED, nullptr);
     y += 50;
+
+    lv_obj_t *ul_row = lv_obj_create(card);
+    lv_obj_remove_style_all(ul_row);
+    lv_obj_set_size(ul_row, lv_pct(100), 34);
+    lv_obj_align(ul_row, LV_ALIGN_TOP_LEFT, 0, y);
+    lv_obj_remove_flag(ul_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *ul_lbl = lv_label_create(ul_row);
+    lv_label_set_text(ul_lbl, "MQTT uplink");
+    lv_obj_set_style_text_color(ul_lbl, lv_color_hex(TH_TEXT2), 0);
+    lv_obj_set_style_text_font(ul_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_align(ul_lbl, LV_ALIGN_LEFT_MID, 0, 0);
+    s_chcreate_uplink = lv_switch_create(ul_row);
+    lv_obj_set_size(s_chcreate_uplink, 56, 28);
+    lv_obj_align(s_chcreate_uplink, LV_ALIGN_RIGHT_MID, 0, 0);
+    lv_obj_add_state(s_chcreate_uplink, LV_STATE_CHECKED);
+    y += 38;
+
+    lv_obj_t *dl_row = lv_obj_create(card);
+    lv_obj_remove_style_all(dl_row);
+    lv_obj_set_size(dl_row, lv_pct(100), 34);
+    lv_obj_align(dl_row, LV_ALIGN_TOP_LEFT, 0, y);
+    lv_obj_remove_flag(dl_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *dl_lbl = lv_label_create(dl_row);
+    lv_label_set_text(dl_lbl, "MQTT downlink");
+    lv_obj_set_style_text_color(dl_lbl, lv_color_hex(TH_TEXT2), 0);
+    lv_obj_set_style_text_font(dl_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_align(dl_lbl, LV_ALIGN_LEFT_MID, 0, 0);
+    s_chcreate_downlink = lv_switch_create(dl_row);
+    lv_obj_set_size(s_chcreate_downlink, 56, 28);
+    lv_obj_align(s_chcreate_downlink, LV_ALIGN_RIGHT_MID, 0, 0);
+    lv_obj_add_state(s_chcreate_downlink, LV_STATE_CHECKED);
+    y += 42;
 
     s_chcreate_status = lv_label_create(card);
     lv_label_set_text(s_chcreate_status, "");
@@ -502,7 +553,7 @@ static void chcreate_open()
     lv_obj_set_size(cancel, 130, 42);
     lv_obj_align(cancel, LV_ALIGN_BOTTOM_LEFT, 0, 0);
     lv_obj_set_style_bg_color(cancel, lv_color_hex(TH_INPUT), 0);
-    lv_obj_set_style_radius(cancel, 8, 0);
+    lv_obj_set_style_radius(cancel, 0, 0);
     lv_obj_add_event_cb(cancel, chcreate_cancel_cb, LV_EVENT_CLICKED, nullptr);
     lv_obj_t *cl = lv_label_create(cancel);
     lv_label_set_text(cl, "Cancel");
@@ -514,7 +565,7 @@ static void chcreate_open()
     lv_obj_set_size(ok, 130, 42);
     lv_obj_align(ok, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
     lv_obj_set_style_bg_color(ok, lv_color_hex(TH_ACCENT), 0);
-    lv_obj_set_style_radius(ok, 8, 0);
+    lv_obj_set_style_radius(ok, 0, 0);
     lv_obj_add_event_cb(ok, chcreate_ok_cb, LV_EVENT_CLICKED, nullptr);
     lv_obj_t *ol = lv_label_create(ok);
     lv_label_set_text(ol, "Create / join");
@@ -560,13 +611,14 @@ static void add_section_header(const char *text)
 static void add_chat_card(ChatEntry *ent, const char *subtitle, uint16_t unread,
                           uint32_t accent_color)
 {
+    (void)accent_color;
     lv_obj_t *card = lv_obj_create(s_chats_list);
     lv_obj_remove_style_all(card);
     lv_obj_set_width(card, lv_pct(100));
-    lv_obj_set_height(card, 64);
+    lv_obj_set_height(card, 54);
     lv_obj_set_style_bg_color(card, lv_color_hex(TH_SURFACE), 0);
     lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(card, 10, 0);
+    lv_obj_set_style_radius(card, 0, 0);
     lv_obj_set_style_pad_all(card, 10, 0);
     lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
@@ -575,36 +627,19 @@ static void add_chat_card(ChatEntry *ent, const char *subtitle, uint16_t unread,
     // Long-press is supported on both DMs and channels (handler distinguishes).
     lv_obj_add_event_cb(card, chat_card_long_pressed, LV_EVENT_LONG_PRESSED, nullptr);
 
-    // Round accent dot/avatar (first initial)
-    lv_obj_t *dot = lv_obj_create(card);
-    lv_obj_remove_style_all(dot);
-    lv_obj_set_size(dot, 40, 40);
-    lv_obj_set_pos(dot, 0, 2);
-    lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_color(dot, lv_color_hex(accent_color), 0);
-    lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
-    lv_obj_remove_flag(dot, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_remove_flag(dot, LV_OBJ_FLAG_CLICKABLE);
+    // Title (+ unread count inline to avoid creating a separate badge object)
+    char title_buf[56];
+    if (unread > 0)
+        snprintf(title_buf, sizeof(title_buf), "%s  (%u)", ent->title, (unsigned)(unread > 99 ? 99 : unread));
+    else
+        snprintf(title_buf, sizeof(title_buf), "%s", ent->title);
 
-    char initial[6] = {0};
-    if (ent->title[0]) {
-        initial[0] = ent->title[0];
-        initial[1] = '\0';
-    } else {
-        initial[0] = '?';
-    }
-    lv_obj_t *dotl = lv_label_create(dot);
-    lv_label_set_text(dotl, initial);
-    lv_obj_set_style_text_color(dotl, lv_color_hex(TH_TEXT), 0);
-    lv_obj_center(dotl);
-
-    // Title
     lv_obj_t *tl = lv_label_create(card);
-    lv_label_set_text(tl, ent->title);
+    lv_label_set_text(tl, title_buf);
     lv_obj_set_style_text_color(tl, lv_color_hex(TH_TEXT), 0);
     lv_obj_set_style_text_font(tl, &lv_font_montserrat_16, 0);
-    lv_obj_set_pos(tl, 52, 2);
-    lv_obj_set_width(tl, SCR_W - 52 - 20 - 40);
+    lv_obj_set_pos(tl, 8, 2);
+    lv_obj_set_width(tl, SCR_W - 20);
     lv_label_set_long_mode(tl, LV_LABEL_LONG_DOT);
 
     // Subtitle / preview
@@ -613,29 +648,9 @@ static void add_chat_card(ChatEntry *ent, const char *subtitle, uint16_t unread,
         lv_label_set_text(sl, subtitle);
         lv_obj_set_style_text_color(sl, lv_color_hex(TH_TEXT2), 0);
         lv_obj_set_style_text_font(sl, &lv_font_montserrat_16, 0);
-        lv_obj_set_pos(sl, 52, 24);
-        lv_obj_set_width(sl, SCR_W - 52 - 20 - 40);
+        lv_obj_set_pos(sl, 8, 24);
+        lv_obj_set_width(sl, SCR_W - 20);
         lv_label_set_long_mode(sl, LV_LABEL_LONG_DOT);
-    }
-
-    // Unread badge
-    if (unread > 0) {
-        lv_obj_t *badge = lv_obj_create(card);
-        lv_obj_remove_style_all(badge);
-        lv_obj_set_size(badge, 26, 22);
-        lv_obj_set_style_radius(badge, 11, 0);
-        lv_obj_set_style_bg_color(badge, lv_color_hex(TH_ACCENT), 0);
-        lv_obj_set_style_bg_opa(badge, LV_OPA_COVER, 0);
-        lv_obj_align(badge, LV_ALIGN_RIGHT_MID, 0, 0);
-        lv_obj_remove_flag(badge, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_remove_flag(badge, LV_OBJ_FLAG_CLICKABLE);
-
-        char num[6];
-        snprintf(num, sizeof(num), "%u", (unsigned)(unread > 99 ? 99 : unread));
-        lv_obj_t *bl = lv_label_create(badge);
-        lv_label_set_text(bl, num);
-        lv_obj_set_style_text_color(bl, lv_color_hex(TH_TEXT), 0);
-        lv_obj_center(bl);
     }
 }
 
@@ -754,7 +769,9 @@ lv_obj_t *chats_screen_create(lv_obj_t *parent)
     lv_obj_set_style_pad_row(s_chats_list, 6, 0);
     lv_obj_set_flex_flow(s_chats_list, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_scroll_dir(s_chats_list, LV_DIR_VER);
-    lv_obj_set_scrollbar_mode(s_chats_list, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_set_scrollbar_mode(s_chats_list, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_clear_flag(s_chats_list, LV_OBJ_FLAG_SCROLL_ELASTIC);
+    lv_obj_add_flag(s_chats_list, LV_OBJ_FLAG_SCROLL_MOMENTUM);
 
     // Floating action button: opens the "New / join channel" modal. Lives on
     // the page (not the scroll list) so it stays put while the list scrolls.
@@ -762,10 +779,10 @@ lv_obj_t *chats_screen_create(lv_obj_t *parent)
     lv_obj_set_size(fab, 56, 56);
     lv_obj_align(fab, LV_ALIGN_BOTTOM_RIGHT, -16, -16);
     lv_obj_set_style_bg_color(fab, lv_color_hex(TH_ACCENT), 0);
-    lv_obj_set_style_radius(fab, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_shadow_width(fab, 12, 0);
+    lv_obj_set_style_radius(fab, 0, 0);
+    lv_obj_set_style_shadow_width(fab, 0, 0);
     lv_obj_set_style_shadow_color(fab, lv_color_black(), 0);
-    lv_obj_set_style_shadow_opa(fab, LV_OPA_40, 0);
+    lv_obj_set_style_shadow_opa(fab, LV_OPA_TRANSP, 0);
     lv_obj_add_event_cb(fab, chats_fab_clicked_cb, LV_EVENT_CLICKED, nullptr);
     lv_obj_move_foreground(fab);
 
@@ -793,7 +810,11 @@ void chats_screen_tick()
     if (chatview_is_open()) return;
     uint32_t t = messages_change_tick();
     if (t != s_chats_last_tick) {
+        s_chats_rebuild_pending = true;
+    }
+    if (s_chats_rebuild_pending && !lv_obj_is_scrolling(s_chats_list)) {
         rebuild_chats_list();
+        s_chats_rebuild_pending = false;
     }
 }
 
@@ -927,7 +948,7 @@ lv_obj_t *maps_screen_create(lv_obj_t *parent)
     lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 64);
     lv_obj_set_style_bg_color(card, lv_color_hex(TH_SURFACE), 0);
     lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(card, 14, 0);
+    lv_obj_set_style_radius(card, 0, 0);
     lv_obj_set_style_pad_all(card, 16, 0);
     lv_obj_set_style_pad_row(card, 14, 0);
     lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);

@@ -103,6 +103,8 @@ void repeater_set_action_buttons_visible(bool visible) {
   if (ui_neighboursbutton)     fn(ui_neighboursbutton,     LV_OBJ_FLAG_HIDDEN);
   if (ui_rebootbutton)         fn(ui_rebootbutton,         LV_OBJ_FLAG_HIDDEN);
   if (ui_statusbutton)         fn(ui_statusbutton,         LV_OBJ_FLAG_HIDDEN);
+  if (ui_repeaterclibutton)    fn(ui_repeaterclibutton,    LV_OBJ_FLAG_HIDDEN);
+  if (ui_repeaterexitclibutton)fn(ui_repeaterexitclibutton,LV_OBJ_FLAG_HIDDEN);
 }
 
 static void cb_repeater_refresh(lv_event_t*) {
@@ -155,9 +157,20 @@ static void cb_repeater_dropdown_changed(lv_event_t*) {
   if (!ui_repeatersdropdown || g_repeater_count == 0) return;
   uint16_t sel = lv_dropdown_get_selected(ui_repeatersdropdown);
   if (sel < (uint16_t)g_repeater_count && g_repeater_list[sel]) {
+    ContactInfo* prev = g_selected_repeater;
+    if (prev && g_mesh) {
+      // Force-stop stale login/session when user switches repeater selection.
+      mesh_stop_repeater_connection(prev->id.pub_key);
+    }
     g_selected_repeater  = g_repeater_list[sel];
     g_repeater_logged_in = false;
     memset(g_login_pending_key, 0, 4);
+    g_login_retry_count = 0;
+    g_login_timeout_ms = 0;
+    g_login_last_pw[0] = '\0';
+    g_status_pending_key = 0;
+    g_neighbours_pending_key = 0;
+    repeater_set_action_buttons_visible(false);
     if (ui_repeaterpassword) lv_textarea_set_text(ui_repeaterpassword, "");
     char msg[96];
     snprintf(msg, sizeof(msg), "Selected: %s\nEnter password to login.", g_selected_repeater->name);
@@ -190,11 +203,21 @@ static void cb_repeater_login(lv_event_t*) {
   strncpy(g_login_last_pw, pw, sizeof(g_login_last_pw) - 1);
   g_login_last_pw[sizeof(g_login_last_pw) - 1] = '\0';
 
+  // Kick path discovery first for far repeaters to improve login reliability.
+  mesh_send_discover_repeaters();
+  uint32_t pre_tag = 0, pre_timeout = 0;
   ContactInfo flood_target = *g_selected_repeater;
   flood_target.out_path_len = OUT_PATH_UNKNOWN;
+  g_mesh->sendRequest(flood_target, (uint8_t)0x01, pre_tag, pre_timeout);
 
-  uint32_t est_timeout;
-  int result = g_mesh->sendLogin(flood_target, pw, est_timeout);
+  uint32_t est_timeout = 0;
+  int result = g_mesh->sendLogin(*g_selected_repeater, pw, est_timeout);
+  if (result != MSG_SEND_FAILED && g_selected_repeater->out_path_len != 0) {
+    // For routed repeaters, also send a flood-assist copy.
+    uint32_t assist_timeout = 0;
+    (void)g_mesh->sendLogin(flood_target, pw, assist_timeout);
+    if (assist_timeout > est_timeout) est_timeout = assist_timeout;
+  }
   {
     char dbg[48];
     snprintf(dbg, sizeof(dbg), "sendLogin result=%d est_timeout=%lu", result, (unsigned long)est_timeout);
@@ -208,6 +231,35 @@ static void cb_repeater_login(lv_event_t*) {
   g_login_retry_count = 0;
   g_login_timeout_ms = millis() + max(est_timeout * 4, (uint32_t)20000);
   repeater_update_monitor("Login sent, waiting for response...");
+}
+
+static void cb_repeater_path_reset(lv_event_t*) {
+  if (!g_selected_repeater || !g_mesh) return;
+  mesh_stop_repeater_connection(g_selected_repeater->id.pub_key);
+  g_selected_repeater->out_path_len = OUT_PATH_UNKNOWN;
+  memset(g_login_pending_key, 0, 4);
+  g_login_retry_count = 0;
+  g_login_timeout_ms = 0;
+  g_repeater_logged_in = false;
+  repeater_set_action_buttons_visible(false);
+  mesh_send_discover_repeaters();
+  repeater_update_monitor("Path reset sent. Discovering route again...");
+}
+
+static void cb_repeater_cli(lv_event_t*) {
+  if (!g_repeater_logged_in || !g_selected_repeater || !g_mesh) return;
+  uint32_t est_timeout;
+  g_mesh->sendCommandData(*g_selected_repeater,
+    g_mesh->getRTCClock()->getCurrentTime(), 0, "cli", est_timeout);
+  repeater_update_monitor("CLI mode request sent.");
+}
+
+static void cb_repeater_exit_cli(lv_event_t*) {
+  if (!g_repeater_logged_in || !g_selected_repeater || !g_mesh) return;
+  uint32_t est_timeout;
+  g_mesh->sendCommandData(*g_selected_repeater,
+    g_mesh->getRTCClock()->getCurrentTime(), 0, "exit", est_timeout);
+  repeater_update_monitor("Exit CLI request sent.");
 }
 
 static void cb_repeater_advert(lv_event_t*) {
@@ -279,12 +331,18 @@ void setup_repeater_screen_callbacks() {
 
   if (ui_repeaterloginbutton)
     lv_obj_add_event_cb(ui_repeaterloginbutton,  cb_repeater_login,      LV_EVENT_CLICKED, nullptr);
+  if (ui_pathresetbutton)
+    lv_obj_add_event_cb(ui_pathresetbutton,      cb_repeater_path_reset, LV_EVENT_CLICKED, nullptr);
   if (ui_statusbutton)
     lv_obj_add_event_cb(ui_statusbutton,         cb_repeater_refresh,    LV_EVENT_CLICKED, nullptr);
   if (ui_repeateradvertbutton)
     lv_obj_add_event_cb(ui_repeateradvertbutton, cb_repeater_advert,     LV_EVENT_CLICKED, nullptr);
   if (ui_neighboursbutton)
     lv_obj_add_event_cb(ui_neighboursbutton,     cb_repeater_neighbours, LV_EVENT_CLICKED, nullptr);
+  if (ui_repeaterclibutton)
+    lv_obj_add_event_cb(ui_repeaterclibutton,    cb_repeater_cli,        LV_EVENT_CLICKED, nullptr);
+  if (ui_repeaterexitclibutton)
+    lv_obj_add_event_cb(ui_repeaterexitclibutton,cb_repeater_exit_cli,   LV_EVENT_CLICKED, nullptr);
   if (ui_rebootbutton)
     lv_obj_add_event_cb(ui_rebootbutton,         cb_repeater_reboot,     LV_EVENT_CLICKED, nullptr);
 

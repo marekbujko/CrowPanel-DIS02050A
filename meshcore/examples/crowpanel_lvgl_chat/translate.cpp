@@ -14,9 +14,11 @@
 
 #if defined(ESP32)
 #include <WiFi.h>
+#include <WiFiClient.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <esp_task_wdt.h>
+#include <esp_heap_caps.h>
 #endif
 
 extern bool g_wifi_connected;
@@ -70,6 +72,25 @@ struct TranslateRequest {
 static TranslateRequest s_queue[TRANSLATE_QUEUE_SIZE];
 static int s_queue_head = 0;
 static int s_queue_tail = 0;
+static uint32_t s_translate_next_attempt_ms = 0;
+static uint32_t s_translate_backoff_ms = 0;
+static uint8_t s_translate_fail_streak = 0;
+static bool s_translate_http_fallback = false;
+static uint32_t s_translate_http_fallback_until_ms = 0;
+static uint32_t s_last_queue_log_ms = 0;
+static uint32_t s_last_lowmem_log_ms = 0;
+static uint8_t s_lowmem_streak = 0;
+
+static bool queue_is_full() {
+    return ((s_queue_head + 1) % TRANSLATE_QUEUE_SIZE) == s_queue_tail;
+}
+
+static void queue_drop_oldest_if_full() {
+    if (queue_is_full()) {
+        s_queue_tail = (s_queue_tail + 1) % TRANSLATE_QUEUE_SIZE;
+        serialmon_append("Translate: queue full, dropped oldest");
+    }
+}
 
 // URL encoding
 
@@ -258,13 +279,13 @@ static bool extract_translated_text(const String& body, String& out) {
 
 #if defined(ESP32)
 
-static bool do_translate(const char* text, const char* target_lang, char* result, int result_size) {
+static bool do_translate_https(const char* text, const char* target_lang, char* result, int result_size) {
     if (!text || !text[0] || !target_lang || !target_lang[0]) return false;
 
     WiFiClientSecure client;
     client.setInsecure();  // No cert validation (unofficial endpoint)
     HTTPClient http;
-    http.setTimeout(8000);
+    http.setTimeout(4500);
 
     String url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=";
     url += target_lang;
@@ -296,6 +317,41 @@ static bool do_translate(const char* text, const char* target_lang, char* result
         serialmon_append("Translate: parse error");
         return false;
     }
+
+    utf8_strlcpy(result, (size_t)result_size, translated.c_str());
+    return true;
+}
+
+static bool do_translate_http(const char* text, const char* target_lang, char* result, int result_size) {
+    if (!text || !text[0] || !target_lang || !target_lang[0]) return false;
+
+    WiFiClient client;
+    HTTPClient http;
+    http.setTimeout(3500);
+
+    String url = "http://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=";
+    url += target_lang;
+    url += "&dt=t&q=";
+    url_encode_into(url, text);
+
+    if (!http.begin(client, url)) {
+        serialmon_append("Translate: http fallback begin failed");
+        return false;
+    }
+    http.addHeader("User-Agent", "Mozilla/5.0");
+
+    esp_task_wdt_reset();
+    int code = http.GET();
+    if (code != 200) {
+        http.end();
+        return false;
+    }
+
+    String body = http.getString();
+    http.end();
+
+    String translated;
+    if (!extract_translated_text(body, translated)) return false;
 
     utf8_strlcpy(result, (size_t)result_size, translated.c_str());
     return true;
@@ -345,6 +401,10 @@ void translate_init() {
 void translate_invalidate_bubbles() {
     // Called when chat panel is cleared; drop all pending requests.
     s_queue_head = s_queue_tail = 0;
+    s_translate_next_attempt_ms = 0;
+    s_translate_backoff_ms = 0;
+    s_translate_fail_streak = 0;
+    s_lowmem_streak = 0;
 }
 
 void translate_request(const char* text, lv_obj_t* bubble) {
@@ -361,13 +421,11 @@ void translate_request(const char* text, lv_obj_t* bubble) {
 
     for (int i = s_queue_tail; i != s_queue_head; i = (i + 1) % TRANSLATE_QUEUE_SIZE) {
         if (s_queue[i].bubble == bubble) return;
+        if (strcmp(s_queue[i].text, text) == 0) return;
     }
 
+    queue_drop_oldest_if_full();
     int next = (s_queue_head + 1) % TRANSLATE_QUEUE_SIZE;
-    if (next == s_queue_tail) {
-        serialmon_append("Translate: queue full");
-        return;
-    }
 
     TranslateRequest& req = s_queue[s_queue_head];
     utf8_strlcpy(req.text, sizeof(req.text), text);
@@ -375,17 +433,27 @@ void translate_request(const char* text, lv_obj_t* bubble) {
     req.bubble = bubble;
     s_queue_head = next;
 
-    char logbuf[80];
-    snprintf(logbuf, sizeof(logbuf), "Translate: queued '%.40s' -> %s", text, translate_lang_code(g_translate_lang_idx));
-    serialmon_append(logbuf);
+    uint32_t now = millis();
+    if ((uint32_t)(now - s_last_queue_log_ms) > 2000) {
+        s_last_queue_log_ms = now;
+        char logbuf[80];
+        snprintf(logbuf, sizeof(logbuf), "Translate: queued '%.40s' -> %s", text, translate_lang_code(g_translate_lang_idx));
+        serialmon_append(logbuf);
+    }
 }
 
 void translate_request_to_file(const char* text, const char* chat_key, lv_obj_t* bubble) {
     if (!text || !text[0] || !chat_key || !chat_key[0]) return;
     if (!g_wifi_connected) return;
 
+    for (int i = s_queue_tail; i != s_queue_head; i = (i + 1) % TRANSLATE_QUEUE_SIZE) {
+        if (strcmp(s_queue[i].text, text) == 0 && strncmp(s_queue[i].chat_key, chat_key, sizeof(s_queue[i].chat_key)) == 0) {
+            return;
+        }
+    }
+
+    queue_drop_oldest_if_full();
     int next = (s_queue_head + 1) % TRANSLATE_QUEUE_SIZE;
-    if (next == s_queue_tail) return;  // queue full
 
     TranslateRequest& req = s_queue[s_queue_head];
     utf8_strlcpy(req.text, sizeof(req.text), text);
@@ -394,24 +462,72 @@ void translate_request_to_file(const char* text, const char* chat_key, lv_obj_t*
     req.bubble = bubble;  // can be null if not viewing chat
     s_queue_head = next;
 
-    char logbuf[80];
-    snprintf(logbuf, sizeof(logbuf), "Translate(file): queued '%.30s' -> %s", text, translate_lang_code(g_translate_lang_idx));
-    serialmon_append(logbuf);
+    uint32_t now = millis();
+    if ((uint32_t)(now - s_last_queue_log_ms) > 2000) {
+        s_last_queue_log_ms = now;
+        char logbuf[80];
+        snprintf(logbuf, sizeof(logbuf), "Translate(file): queued '%.30s' -> %s", text, translate_lang_code(g_translate_lang_idx));
+        serialmon_append(logbuf);
+    }
 }
 
 void translate_loop() {
 #if defined(ESP32)
     if (!g_wifi_connected) return;
     if (s_queue_head == s_queue_tail) return;
+    uint32_t now = millis();
+    if ((int32_t)(now - s_translate_next_attempt_ms) < 0) return;
+
+    if (s_translate_http_fallback && (int32_t)(now - s_translate_http_fallback_until_ms) > 0) {
+        s_translate_http_fallback = false;
+        s_lowmem_streak = 0;
+        serialmon_append("Translate: leaving HTTP fallback");
+    }
+
+    const size_t free8 = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    const size_t largest8 = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    if (free8 < 38000 || largest8 < 16000) {
+        s_lowmem_streak++;
+        if ((uint32_t)(now - s_last_lowmem_log_ms) > 5000) {
+            s_last_lowmem_log_ms = now;
+            char b[96];
+            snprintf(b, sizeof(b), "Translate: low mem free=%u largest=%u", (unsigned)free8, (unsigned)largest8);
+            serialmon_append(b);
+        }
+        if (s_lowmem_streak >= 5) {
+            s_translate_http_fallback = true;
+            s_translate_http_fallback_until_ms = now + 120000UL;
+        }
+        s_translate_next_attempt_ms = now + 2000;
+        return;
+    }
+    s_lowmem_streak = 0;
 
     TranslateRequest& req = s_queue[s_queue_tail];
-    s_queue_tail = (s_queue_tail + 1) % TRANSLATE_QUEUE_SIZE;
 
     const char* lang = translate_lang_code(g_translate_lang_idx);
 
     char result[384];
     esp_task_wdt_reset();
-    if (do_translate(req.text, lang, result, sizeof(result))) {
+    bool ok = false;
+    if (s_translate_http_fallback) ok = do_translate_http(req.text, lang, result, sizeof(result));
+    else ok = do_translate_https(req.text, lang, result, sizeof(result));
+
+    if (!ok && !s_translate_http_fallback) {
+        s_translate_fail_streak++;
+        if (s_translate_fail_streak >= 3) {
+            s_translate_http_fallback = true;
+            s_translate_http_fallback_until_ms = now + 120000UL;
+            serialmon_append("Translate: switching to HTTP fallback");
+        }
+    } else if (ok) {
+        s_translate_fail_streak = 0;
+    }
+
+    if (ok) {
+        s_translate_backoff_ms = 0;
+        s_translate_next_attempt_ms = now;
+        s_queue_tail = (s_queue_tail + 1) % TRANSLATE_QUEUE_SIZE;
         if (strcmp(result, req.text) != 0) {
             // Show in live bubble if available
             if (req.bubble) {
@@ -421,6 +537,14 @@ void translate_loop() {
             if (req.chat_key[0]) {
                 append_translation_to_last_rx(String(req.chat_key), result);
             }
+        }
+    } else {
+        s_translate_backoff_ms = (s_translate_backoff_ms == 0) ? 1000 : (s_translate_backoff_ms * 2);
+        if (s_translate_backoff_ms > 12000) s_translate_backoff_ms = 12000;
+        s_translate_next_attempt_ms = now + s_translate_backoff_ms;
+        // Give up this entry after repeated failures to avoid starving the queue forever.
+        if (s_translate_fail_streak >= 6 || s_translate_http_fallback) {
+            s_queue_tail = (s_queue_tail + 1) % TRANSLATE_QUEUE_SIZE;
         }
     }
 #endif
