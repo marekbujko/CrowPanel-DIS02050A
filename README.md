@@ -1,5 +1,5 @@
 <p align="center">
-  <h1 align="center">CrowPanel Advance 5" (DIS02050A v1.1 & V1.2)<br>Dual-Boot LoRa Mesh Firmware</h1>
+  <h1 align="center">CrowPanel Advance 5" (DIS02050A v1.1 & v1.2)<br>Dual-Boot LoRa Mesh Firmware</h1>
   <p align="center">
     Run <b>MeshCore</b> or a custom <b>Meshtastic</b> UI on your CrowPanel - switch at boot, no reflashing.
   </p>
