@@ -211,6 +211,37 @@ static volatile ScanState s_scan_state  = SCAN_IDLE;
 static ScannedNetwork s_scan_results[SCAN_MAX];
 static int s_scan_count = 0;
 
+static int run_wifi_scan_with_recovery()
+{
+    // Clear any stale scan state first.
+    WiFi.scanDelete();
+
+    // Build a clean STA context before scanning. This avoids stuck scan
+    // states on some ESP32-S3 boards after mode transitions.
+    WiFi.disconnect(false, true);
+    WiFi.mode(WIFI_MODE_NULL);
+    vTaskDelay(pdMS_TO_TICKS(60));
+    WiFi.mode(WIFI_STA);
+    vTaskDelay(pdMS_TO_TICKS(120));
+
+    int n = -1;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        n = WiFi.scanNetworks(/*async*/ false, /*hidden*/ false);
+        if (n >= 0)
+            return n;
+
+        LOG_WARN("mcui: WiFi scan attempt %d failed (%d), retrying", attempt + 1, n);
+        WiFi.scanDelete();
+        WiFi.disconnect(false, true);
+        WiFi.mode(WIFI_MODE_NULL);
+        vTaskDelay(pdMS_TO_TICKS(80));
+        WiFi.mode(WIFI_STA);
+        vTaskDelay(pdMS_TO_TICKS(150));
+    }
+
+    return n;
+}
+
 static void aux_lock_init()
 {
     if (!s_aux_lock) s_aux_lock = xSemaphoreCreateMutex();
@@ -329,10 +360,7 @@ class McAuxThread : public concurrency::OSThread
         if (s_scan_state == SCAN_REQUESTED) {
             s_scan_state = SCAN_RUNNING;
             LOG_INFO("mcui: starting WiFi scan");
-            // Ensure station mode is available so scanNetworks returns
-            // results even if WiFi is currently disabled in config.
-            WiFi.mode(WIFI_STA);
-            int n = WiFi.scanNetworks(/*async*/ false, /*hidden*/ false);
+            int n = run_wifi_scan_with_recovery();
             if (n < 0) {
                 LOG_WARN("mcui: WiFi scan failed (%d)", n);
                 s_scan_count = 0;
